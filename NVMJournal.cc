@@ -746,7 +746,8 @@ NVMJournal::ObjectRef NVMJournal::get_object(coll_t &cid, ghobject_t &oid, bool 
 		return NULL;
 	    ObjectRef o = new Object(cid, oid);
 	    coll->Object_hash[oid] = o;
-	    coll->Object_map[oid] = o; 
+	    coll->Object_map[oid] = o;
+	    store->_touch(coid, oid);
 	}
 	
 	ObjectRef o = coll->Object_hash[oid];
@@ -896,33 +897,101 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         coll_t cid = i.decode_cid();
                         ghobject_t oid = i.decode_oid();
                         // SET object.stat to REMOVED
-                        // and call store->remove(cid, oid)
+                        // and call store->_remove(cid, oid)
                         r = _remove (cid, oid);
                 }
                 break;
+	   
+	    /* deal with clone operation */
+	    case Transaction::OP_CLONE:
+		{   /*clone data, xattr and omap ...*/
+		    coll_t cid = i.decode_cid();
+		    ghobject_t oid = i.decode_oid();
+		    ghobject_t noid = i.decode_oid();
+		    // FIXME: how to deal with clone op
+		    // 1) flush journal data to backend store
+		    // 2) invoke store->_clone(...)
+		    // 3) mark this object clean && remove it from collection
+		    // 4) create two objects as the children of original object
+		    r = _clone(cid, oid, noid);
+		}
+		break;
+	    case Transcation::OP_CLONERANGE:
+		{
+		    /*clone data only ...*/
+		    // FIXME:
+		    // 1) flush converd range of data to backend storage
+		}
+                break;
 
-	    default:
-		// FIXME
-		if (start_pos < entry_pos && entry_pos < meta_sync_pos)
-		    break;
-		if (!(meta_sync_pos < entry_pos && entry_pos < start_pos))
-		    break;
-		// FIXME
-                // store->do_op(op, i);
-	}
+         default:
+                if (start_pos < entry_pos && entry_pos < meta_sync_pos)
+                    break;
+                if (!(meta_sync_pos < entry_pos && entry_pos < start_pos))
+                    break;
+                r = do_other_op(op, i);
+        }
         ++pos;
     }
 }
+int NVMJournal::do_other_op(int op, Transaction::iterator& p)
+{
+    int r;
+    switch(op)   /* deal with the attributes of objects */
+    {
+	case Transation::OP_SETATTR: 
+	    {
+		coll_t cid = i.decode_cid();
+		ghobject_t oid = i.decode_oid();
+		string name = i.decode_attrname();
+		bufferlist bl;
+		i.decode_bl(bl);
+		map<string, bufferptr> to_set;
+		to_set[name] = bufferptr(bl.c_str(), bl.length());
+		r = store->setattrs(cid, oid, to_set);
+            }
+	    break;
+	case Transaction::OP_SETATTRS:
+	    {
+		coll_t cid = i.decode_cid();
+		ghobject_t oid = i.decode_oid();
+		map<string, bufferptr> aset;
+		i.decode_attrset(aset);
+		r = store->_setattrs();
+	    }
+	    break;
+        case Transaction::OP_RMATTR:
+            {
+		coll_t cid = i.decode_cid();
+		ghobject_t oid = i.decode_oid();
+		string name = i.decode_attrname();
+		r = store->_rmattr(cid, oid, name);
+	    }
+	    break;
+	case Transaction::OP_RMATTRS:
+	    {
+		coll_t cid = i.decode_cid();
+		ghobject_t oid = i.decode_oid();
+		r = store->_rmattrs(cid, oid);
+	    }
+	    break;
+	deafult:
+	    derr << "bad op " << op << endl;
+	    assert(0);
+    }
+    return r;
+}
 int NVMJournal::_touch(coll_t cid, ghobject_t oid)
 {
-        return 0;
+    // make sure the existance of object in the backend storage
+    return store->_touch(cid, oid);
 }
 /* do write */
-void NVMJournal::_write(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff)
+int NVMJournal::_write(coll_t cid, const ghobject_t& oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff)
 {
     assert((entry_pos & CEPH_PAGE_MASK) == 0);
 
-    // keep reference to the object
+    // keep reference to the object, and touch the object if needed..
     ObjectRef obj = get_object(cid, oid, true);
     if (!obj) {
 	assert(0 == "got unexpected error from _write ");
@@ -944,9 +1013,10 @@ void NVMJournal::_write(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len, 
         Mutex::Locker locker(Journal_queue_lock);
         Journal_queue.push_back(bh);
     }
+    return 0;
 }
 /* zero */
-int NVMJournal::_zero(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len)
+int NVMJournal::_zero(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len)
 {
     ObjectRef obj = get_object(cid, oid, true);
     if (!obj)
@@ -977,7 +1047,7 @@ int NVMJournal::_zero(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len)
 define _ONE_GB  \
         (1024*1024*1024)
 /* do truncate */
-void NVMJournal::_truncate(coll_t cid, ghobject_t oid, uint32_t off)
+int NVMJournal::_truncate(coll_t cid, const ghobject_t &oid, uint32_t off)
 {
         ObjectRef obj = get_object(cid, oid, true);
         if (!obj || obj->stat == Object::REMOVED)
@@ -1003,7 +1073,7 @@ void NVMJournal::_truncate(coll_t cid, ghobject_t oid, uint32_t off)
         return 0;
 }
 /* _remove */
-void NVMJournal::_remove(coll_t cid, ghobject_t oid)
+int NVMJournal::_remove(coll_t cid, const ghobject_t& oid)
 {
         ObjectRef obj = get_object(cid, oid);
         // invalid the object in ssd
@@ -1019,15 +1089,18 @@ void NVMJournal::_remove(coll_t cid, ghobject_t oid)
                         merge_new_bh(obj, bh);
                         delete_bh(obj, 0, _ONE_GB, BufferHead::ZERO);
                         obj->stat = Object::REMOVED;
+			store->_remove(cid, oid);
                 }
 
                 delete bh;
                 put_object(obj);
         }
-        // FIXME
-        // store->_remove(cid, oid);
+	return 0;
 }
-
+int NVMJournal::_clone(coll_t cid, const ghobject_t& oid, const ghobject_t *noid)
+{
+    return 0;
+}
 void NVMJournal::merge_new_bh(ObjectRef obj, BufferHead* new_bh)
 {
     assert(obj->lock.is_wlocked());
@@ -1160,7 +1233,6 @@ void NVMJournal::build_read(coll_t &cid, ghobject_t &oid, uint64_t off, size_t l
 
     uint32_t end = off + len;
 
-    // FIXME:the bufferptr must be page aligned
     while (p != obj->data.end()) {
 	BufferHead *pbh = p->second;
 	if (pbh->ext.start <= off) {
@@ -1189,7 +1261,7 @@ void NVMJournal::build_read(coll_t &cid, ghobject_t &oid, uint64_t off, size_t l
                 if (pbh->bentry != BufferHead::ZERO && pbh->bentry != BufferHead::TRUNC)
                       op.trans[off] = SSD_OFF(pbh) + (off - pbh->ext.start);
                 else 
-                      op.trans[off] = SSD_OFF(pbh->bentry);
+                      op.trans[off] = SSD_OFF(pbh);
 
 		op.hit[off] = end - off;
 		return;
@@ -1240,6 +1312,9 @@ void NVMJournal::do_read(ReadOp &op)
             data[p->front] = bp;
         }
         else {
+	    map<uint32_t, uint32_t>::iterator next = p;
+	    ++ next;
+	    assert(next == op.hit.end());
             assert(bentry == BufferHead::TRUNC);
             /* do nothing */
         } 
@@ -1250,6 +1325,7 @@ void NVMJournal::do_read(ReadOp &op)
     
     map<uint32_t, uint32_t>::iterator p = op.miss.begin();
     while(p != op.miss.end()) {
+	// FIXME: should get missing blocks from memstore ...
 	data[p->first] = bufferptr(p->second);
     }
 
@@ -1437,7 +1513,6 @@ void NVMJournal::do_ev(Ev *ev, ThreadPool::TPHandle *handle)
     assert(fds);
 
     RWLock::WLocker l(obj->lock);
-    // FIXME: Check the existence of object here...
 
     while (p != ev->queue.end()) {
 	BufferHead *bh = *p;
@@ -1448,7 +1523,9 @@ void NVMJournal::do_ev(Ev *ev, ThreadPool::TPHandle *handle)
         if (t != obj->data.begin())
             -- t;
 
-        while (t!=obj->data.end()) {
+	// nothing special to do with removed object,
+	// because of the empty data map
+        while (t != obj->data.end()) {
             uint32_t off = t->first;
             if (off > bh->ext.end) 
                 break;

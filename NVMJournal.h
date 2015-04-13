@@ -399,8 +399,12 @@ class NVMJournal : public RWJournal {
 	void do_op(Op *op, ThreadPool::TPHandle *handle);
 	void do_ev(Ev *evi, ThreadPool::TPHandle *handle);
 	void do_transaction(Transaction *t, uint64_t seq, uint64_t entry_pos, uint32_t &off);
-	void _write(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff);
-
+	int _touch(coll_t cid, const ghobject_t& oid);
+	int _write(coll_t cid, const ghobject_t& oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff);
+	int _zero(coll_t cid, const ghobject_t& oid, uint32_t off, uint32_t len);
+	int _truncate(coll_t cid, const ghobject_t& oid, uint32_t off);
+	int _remove(coll_t cid, const ghobect_t& oid);
+	int _clone(coll_t cid, const ghobject_t& oid);
 
 	/* memory data structure */
 
