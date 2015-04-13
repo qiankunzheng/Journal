@@ -19,12 +19,14 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "NVMJournal "
 
-int NVMJournal::_open()
+int NVMJournal::_open(bool io_direct)
 {
-    int flags;
+    int flags = O_RDWR | O_DSYNC;;
     int ret;
 
-    flags = O_RDWR | O_DIRECT | O_DSYNC;
+    if (io_direct)
+        flags |=  O_DIRECT;
+
     if (fd >= 0) {
 	if (TEMP_FAILURE_RETRY(::close(fd))) {
 	    derr << "NVMJournal::Open: error closing old fd: "
@@ -62,12 +64,21 @@ int NVMJournal::_open()
     }
     max_length = bdev_size - bdev_size % CEPH_PAGE_SIZE;
 
-    aio_ctx = 0;
-    ret = io_setup(128, &aio_ctx);
-    if (ret < 0) {
-	derr << "NVMJournal::Open: unable to setup io_context " << cpp_strerror(errno) << dendl;
-	goto out_fd;
+    if (io_direct) {
+        if (aio_ctx_ready) {
+            io_destory(aio_ctx);
+        }
+        aio_ctx_ready = false;        
+
+        aio_ctx = 0;
+        ret = io_setup(128, &aio_ctx);
+        if (ret < 0) {
+            derr << "NVMJournal::Open: unable to setup io_context " << cpp_strerror(errno) << dendl;
+            goto out_fd;
+        }
+        aio_ctx_ready = true;
     }
+   
     return 0;
 
 out_fd:
@@ -106,6 +117,7 @@ int NVMJournal::create()
     bufferlist bl;
     string fn = conf + "journal_header.dec";
     string err;
+    bool direct = false;
 
     int r = bl.read_file(fn.c_str(), &err);
     if (r < 0) 
@@ -126,8 +138,9 @@ int NVMJournal::create()
         return r;
     }
 
-   r =  _open();
-   if (r)
+    // open the Journal without O_DIRECT flag
+    r =  _open(direct);
+    if (r)
        return r;
    
    start_pos = header.start_pos;
@@ -139,6 +152,12 @@ int NVMJournal::create()
    r = _journal_replay();
    if (r)
        return r;
+
+   // reopen the Journal with flag |= O_DIRECT
+   direct = true;
+   r = _open(true);
+   if (r)
+        retuurn r; 
 
    if (zero_buf)
         delete[] zero_buf;
@@ -218,6 +237,8 @@ NVMJournal::NVMJournal(string dev, string c, MemStore *s, Finisher *fin)
     op_throttle_lock("NVMJournal::op_throttle_lock", false, true, false, g_ceph_context),
     op_qeueu_len(0),
     aioq_lock ("NVMJournal::aioq_lock",false, true, false, g_ceph_context), 
+    aio_ctx(0), 
+    aio_ctx_ready(false),
     zero_buf (NULL), 
     wrap (false),
     writer(this),
@@ -424,7 +445,11 @@ int NVMJournal::prepare_multi_write(bufferlist& bl, list<Op*>& ops)
 
     return 0;
 }
-// FIXME
+/* read_entry
+ * this function read the journal with fd 
+ * which opened without flag DIRECT, SO there
+ * is no need PAGE-ALIGNED buffer... 
+ */
 int NVMJournal::read_entry(uint64_t &pos, uint64_t &next_seq, Op *op)
 {
     entry_header_t h;
@@ -729,7 +754,6 @@ NVMJournal::ObjectRef NVMJournal::get_object(coll_t &cid, ghobject_t &oid, bool 
 	return 0;
     }
 }
-
 void NVMJournal::put_object(ObjectRef obj) 
 {
     if (!obj->put()) {
@@ -889,34 +913,9 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
         ++pos;
     }
 }
-/* zero */
-int NVMJournal::_zero(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len)
+int NVMJournal::_touch(coll_t cid, ghobject_t oid)
 {
-    ObjectRef obj = get_object(cid, oid, true);
-    if (!obj)
-        assert(0 == "get unexpected error from _zero");
-    
-    if (obj->stat == Object::REMOVED)
         return 0;
-
-    BufferHead *bh = new BufferHead;
-    bh->owner = obj;
-    bh->ext.start = off;
-    bh->ext.end = off + len;
-    bh->bentry = BufferHead::ZERO;
-    bh->boff = 0;
-
-    {
-        RWLock::WLocker l(obj->lock);
-        merge_new_bh (obj, bh);
-    }
-
-    {
-        // deallocate the object space when evicted
-        Mutex::Locker l(Journal_queue_lock);
-        Journal_queue.push_back (bh);
-    }
-    return 0;
 }
 /* do write */
 void NVMJournal::_write(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff)
@@ -946,8 +945,38 @@ void NVMJournal::_write(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len, 
         Journal_queue.push_back(bh);
     }
 }
+/* zero */
+int NVMJournal::_zero(coll_t cid, ghobject_t oid, uint32_t off, uint32_t len)
+{
+    ObjectRef obj = get_object(cid, oid, true);
+    if (!obj)
+        assert(0 == "get unexpected error from _zero");
+    
+    if (obj->stat == Object::REMOVED)
+        return 0;
+
+    BufferHead *bh = new BufferHead;
+    bh->owner = obj;
+    bh->ext.start = off;
+    bh->ext.end = off + len;
+    bh->bentry = BufferHead::ZERO;
+    bh->boff = 0;
+
+    {
+        RWLock::WLocker l(obj->lock);
+        merge_new_bh (obj, bh);
+    }
+
+    {
+        // deallocate the object space when evicted
+        Mutex::Locker l(Journal_queue_lock);
+        Journal_queue.push_back (bh);
+    }
+    return 0;
+}
+define _ONE_GB  \
+        (1024*1024*1024)
 /* do truncate */
-define _ONE_GB  (1024*1024*1024)
 void NVMJournal::_truncate(coll_t cid, ghobject_t oid, uint32_t off)
 {
         ObjectRef obj = get_object(cid, oid, true);

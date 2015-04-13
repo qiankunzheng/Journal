@@ -103,7 +103,7 @@ class NVMJournal : public RWJournal {
 	string conf;
 	int fd;
 
-	int _open();
+	int _open(bool io_direct = true);
 	int _journal_replay(); // replay
 
 	class ApplyManager {
@@ -186,6 +186,7 @@ class NVMJournal : public RWJournal {
 	deque<aio_info> aio_queue; 
 
 	io_context_t aio_ctx;
+	bool aio_ctx_ready;
 
 	void do_aio_write(bufferlist &bl, uint64_t seq);
 
