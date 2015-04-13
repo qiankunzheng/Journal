@@ -186,6 +186,7 @@ private:
   Finisher finisher;
 
   // + by tanghao
+  friend class NVMJournal;
   NVMJournal journal;
   // end
   void _do_transaction(Transaction& t);
