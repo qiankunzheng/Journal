@@ -393,10 +393,11 @@ int NVMJournal::prepare_multi_write(bufferlist& bl, list<Op*>& ops)
 	} while(seq && trans);
     }
 
-    if(!count || !wrap) 
+    // no op && no need to wrap journal
+    if(!count && !wrap) 
 	return -1;
 
-    if(!count)
+    if(!count) // wrap the journal
     	return 0;
 
     entry_header_t header;
@@ -468,7 +469,7 @@ int NVMJournal::read_entry(uint64_t &pos, uint64_t &next_seq, Op *op)
     	assert(h.seq == 0);
     	entry_header_t h2;
     	safe_pread(fd, &h2, sizeof(h2), pos);
-    	if (!memcmp(&h,&h2,sizeof(h)))
+    	if (memcmp(&h,&h2,sizeof(h)))
     		return -1;
     	pos = 0;
     	return 0;
@@ -483,7 +484,7 @@ int NVMJournal::read_entry(uint64_t &pos, uint64_t &next_seq, Op *op)
     entry_header_t h2;
     pos += h.length + h.post_pad;
     safe_pread(fd, &h2, sizeof(h2), pos);
-    if (!memcmp(&h, &h2, sizeof(h)))
+    if (memcmp(&h, &h2, sizeof(h)))
 	return -1;
     pos += sizeof(h);
 
@@ -504,10 +505,22 @@ int NVMJournal::read_entry(uint64_t &pos, uint64_t &next_seq, Op *op)
     for (int n = 0; n < h.ops; n++) {
         bufferlist ts;
         ::decode(ts, p);
-	Transaction *trans = new ObjectStore::Transaction();
         bufferlist::iterator t = ts.begin();
-	trans->_decode (t);
-	op->tls.push_back(trans);
+        Transaction *trans = NULL;
+        bool have_more = true;
+        do {
+	    trans = new ObjectStore::Transaction();
+	    try {
+	    	trans->_decode (t);
+	    }
+	    catch (buffer::error& e) {
+	    	delete trans;
+	    	trans = NULL;
+	    	have_more = false;
+	    }
+	    if (trans)
+	    	op->tls.push_back(trans);
+        }while(have_more);
     }
     return 0;
 }
@@ -757,16 +770,21 @@ NVMJournal::ObjectRef NVMJournal::get_object(coll_t &cid, ghobject_t &oid, bool 
 }
 void NVMJournal::put_object(ObjectRef obj) 
 {
-    if (!obj->put()) {
-        CollectionRef coll;
-        coll = get_collection(obj->coll);
-        if (coll) 
-        {
-            Mutex::Locker l(coll->lock);
-            coll->Object_hash.erase(obj->oid);
+    CollectionRef coll;
+    bool rm = false;
+    coll = get_collection(obj->coll);
+    if (coll) {
+    	Mutex::Locker l(coll->lock);
+    	if (!obj->put()) {
+    	    coll->Object_hash.erase(obj->oid);
             coll->Object_map.erase(obj->oid);
-        }
-        delete obj;
+            rm = true;
+    	}
+    }
+    else if (!obj->put()) 
+    	rm = true;
+    if (rm) {
+    	delete obj;
     }
 }
 
@@ -823,6 +841,15 @@ void NVMJournal::do_op(Op *op, ThreadPool::TPHandle *handle)
     }
     apply_manager.op_apply_finish();
 }
+// check if need to update the backend store
+inline bool NVMJournal::need_to_update_store(uint64_t entry_pos)
+{
+    if (start_pos < entry_pos && entry_pos < meta_sync_pos)
+    	return false;
+    if (!(meta_sync_pos < entry_pos && entry_pos < start_pos))
+    	return false;
+    return true;
+}
 // FIXME
 void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos, uint32_t &offset) 
 {
@@ -848,7 +875,8 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         coll_t cid = i.decode_cid();
                         ghobject_t oid = i.decode_oid();
                         /* do nothing */
-                        r = _touch(cid, oid);
+                        if(need_to_update_store(entry_pos))
+                        	r = _touch(cid, oid);
                 }
                 break;
 	    case Transaction::OP_WRITE:
@@ -899,6 +927,8 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         // SET object.stat to REMOVED
                         // and call store->_remove(cid, oid)
                         r = _remove (cid, oid);
+                        if (need_to_update_store(entry_pos))
+                            r = store->_remove(cid, oid);
                 }
                 break;
 	   
@@ -909,11 +939,12 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
 		    ghobject_t oid = i.decode_oid();
 		    ghobject_t noid = i.decode_oid();
 		    // FIXME: how to deal with clone op
-		    // 1) flush journal data to backend store
+		    // 1) flush journal data to backend store, if update_store == true
 		    // 2) invoke store->_clone(...)
 		    // 3) mark this object clean && remove it from collection
 		    // 4) create two objects as the children of original object
-		    r = _clone(cid, oid, noid);
+		    bool update_store = need_to_update_store(entry_pos);
+		    r = _clone(cid, oid, noid, update_store);
 		}
 		break;
 	    case Transcation::OP_CLONERANGE:
@@ -925,11 +956,8 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                 break;
 
          default:
-                if (start_pos < entry_pos && entry_pos < meta_sync_pos)
-                    break;
-                if (!(meta_sync_pos < entry_pos && entry_pos < start_pos))
-                    break;
-                r = do_other_op(op, i);
+                if (need_to_update_store(entry_pos))
+                	r = do_other_op(op, i);
         }
         ++pos;
     }
@@ -1089,7 +1117,7 @@ int NVMJournal::_remove(coll_t cid, const ghobject_t& oid)
                         merge_new_bh(obj, bh);
                         delete_bh(obj, 0, _ONE_GB, BufferHead::ZERO);
                         obj->stat = Object::REMOVED;
-			store->_remove(cid, oid);
+			//store->_remove(cid, oid);
                 }
 
                 delete bh;
