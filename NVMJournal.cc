@@ -1413,14 +1413,12 @@ void NVMJournal::build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp&
 {
         if (0 == parent)
                 return ;
-        if (parent->data.empty()) {
-                obj.parent = NULL;
-                put_object(parent);
-                return ;
-        }
+        if (parent->data.empty())
+                return;
 
         {
-                Mutex::Locker l(parent->lock);
+                get_read_lock(parent);
+                op.parent.push_back(parent);
                 map<uint32_t, uint32_t>::iterator p = op->miss.begin();
                 while (p != op->miss.end()) {
 
@@ -1470,6 +1468,10 @@ void NVMJournal::do_read(ReadOp &op)
     }
 
     put_read_lock(op.obj);
+    while(!op.parent.empty()) {
+       put_read_lock(op.parent.back());
+       op.parent.pop_back();
+    }
     put_object(op.obj);
     
     map<uint32_t, uint32_t>::iterator p = op.miss.begin();
