@@ -581,6 +581,7 @@ class NVMJournal : public RWJournal {
 	struct ReadOp 
 	{
 	    ObjectRef obj;
+            list<ObjectRef> parent;
 	    uint32_t off;
 	    uint32_t length;
 	    bufferlist buf;
