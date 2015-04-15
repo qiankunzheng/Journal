@@ -1162,7 +1162,7 @@ int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t *dst,
 	    map<uint32_t, BufferHead *>::iterator p = src_obj->data.begin();
 	    while (p != src_obj->data.end()) 
 	    {
-		BufferHead *pbh = *p->second;
+		BufferHead *pbh = p->second;
 		uint64_t pos = pbh->bentry;
 		uint64_t off = pbh->ext.start;
 		size_t len = pbh->ext.end - off;
