@@ -404,7 +404,7 @@ class NVMJournal : public RWJournal {
 	int _zero(coll_t cid, const ghobject_t& oid, uint32_t off, uint32_t len);
 	int _truncate(coll_t cid, const ghobject_t& oid, uint32_t off);
 	int _remove(coll_t cid, const ghobect_t& oid);
-	int _clone(coll_t cid, const ghobject_t& oid);
+	int _clone(coll_t cid, const ghobject_t& oid, const ghobject_t& noid, bool flush);
 
 	/* memory data structure */
 
@@ -502,7 +502,9 @@ class NVMJournal : public RWJournal {
 
 		Object(coll_t c, ghobject_t o) :
 		    coll(c), oid(o), 
-		    ref(0), lock("NVMJournal::lock"){ }
+		    ref(0), 
+		    stat(DIRTY),
+		    lock("NVMJournal::lock"){ }
 
 		void get() { 
 		    ref.inc(); 
@@ -538,7 +540,16 @@ class NVMJournal : public RWJournal {
 
 	CollectionRef get_collection(coll_t &cid, bool create = false) ;
 
-	ObjectRef get_object(coll_t &cid, ghobject_t &oid, bool create = false) ;
+	ObjectRef get_object(coll_t &cid, const ghobject_t &oid, bool create = false) ;
+	ObjectRef get_object(CollectionRef coll, const ghobject_t &oid, bool create = false);
+
+	inline void erase_object_without_lock(CollectionRef coll, ObjectRef obj) ;
+	void erase_object_with_lock(CollectionRef coll, ObjectRef obj) {
+		if (!coll)
+			return;
+		Mutex::Locker l(coll->lock);
+		erase_object_without_lock(coll, obj);
+	}
 
 	void put_object(ObjectRef obj) ;
 	
@@ -550,6 +561,17 @@ class NVMJournal : public RWJournal {
 	    assert(obj);
 	    obj->lock.put_read();
 	}
+	void get_write_lock(ObjectRef obj) {
+	    assert(obj);
+	    obj->lock.get_wrtie();
+	}
+	void put_write_lock(ObjectRef obj) {
+	    assert(obj);
+	    obj->lock.put_write();
+	}
+
+	inline void NVMJournal::get_objects_lock(ObjectRef a, ObjectRef b);
+	inline void NVMJournal::put_objects_lock(ObjectRef a, ObjectRef b);
 
 	void merge_new_bh(ObjectRef obj, BufferHead *bh);
 	void delete_bh(ObjectRef obj, uint32_t off, uint32_t end, uint32_t bentry);
@@ -568,7 +590,8 @@ class NVMJournal : public RWJournal {
 
 	    map<uint32_t, uint32_t> miss; // 
 	};
-	void build_read(coll_t &cid, ghobject_t &oid, uint64_t off, size_t len, ReadOp &op);
+	void build_read(coll_t &cid, const ghobject_t &oid, uint64_t off, size_t len, ReadOp &op);
+	void build_read_from_parent(ObjectRef parent, ReadOp& op);
 	void do_read(ReadOp &op);
 
     public:
