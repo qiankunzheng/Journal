@@ -1411,7 +1411,7 @@ void NVMJournal::build_read(coll_t &cid, ghobject_t &oid, uint64_t off, size_t l
 }
 void NVMJournal::build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp& op)
 {
-        if (0 = parent)
+        if (0 == parent)
                 return ;
         if (parent->data.empty()) {
                 obj.parent = NULL;
