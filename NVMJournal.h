@@ -423,6 +423,8 @@ class NVMJournal : public RWJournal {
 	    uint32_t boff;	
 	};
 
+	void _flush_bh(ObjectRef obj, BufferHead *pbh);
+
 	deque<BufferHead*> Journal_queue;
 	Mutex Journal_queue_lock;
 	Cond Journal_queue_cond;
@@ -603,6 +605,10 @@ class NVMJournal : public RWJournal {
 
 	    map<uint32_t, uint32_t> missing; // 
 	};
+	void map_read(ObjectRef obj, uint32_t off, uint32_t end,
+                        map<uint32_t, uint32_t> &hits,
+                        map<uint32_t, uint64_t> &trans,
+                        map<uint32_t, uint32_t> &missing);
 	void build_read(coll_t &cid, const ghobject_t &oid, uint64_t off, size_t len, ReadOp &op);
 	void build_read_from_parent(ObjectRef parent, ReadOp& op);
 	void do_read(ReadOp &op);

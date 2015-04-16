@@ -862,7 +862,8 @@ bool NVMJournal::need_to_update_store(uint64_t entry_pos)
 }
 // FIXME
 void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos, uint32_t &offset) 
-{
+{ 
+    bool update_store = need_to_updaate_store(entry_pos);
     Transaction::iterator i = t->begin();
     int r = 0;
     while (i.have_op()) {
@@ -885,7 +886,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         coll_t cid = i.decode_cid();
                         ghobject_t oid = i.decode_oid();
                         /* do nothing */
-                        if(need_to_update_store(entry_pos))
+                        if(need_update)
                         	r = _touch(cid, oid);
                 }
                 break;
@@ -937,7 +938,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         // SET object.stat to REMOVED
                         // and call store->_remove(cid, oid)
                         r = _remove (cid, oid);
-                        if (need_to_update_store(entry_pos))
+                        if (need_update)
                             r = store->_remove(cid, oid);
                 }
                 break;
@@ -946,30 +947,31 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
 	    case Transaction::OP_CLONE:
 		{   /*clone data, xattr and omap ...*/
 		    coll_t cid = i.decode_cid();
-		    ghobject_t oid = i.decode_oid();
-		    ghobject_t noid = i.decode_oid();
-		    // FIXME: how to deal with clone op
-		    // 1) flush journal data to backend store, if update_store == true
-		    // 2) invoke store->_clone(...)
-		    // 3) mark this object clean && remove it from collection
-		    // 4) create two objects as the children of original object
-		    bool update_store = need_to_update_store(entry_pos);
-		    r = _clone(cid, oid, noid, update_store);
+		    ghobject_t src = i.decode_oid();
+		    ghobject_t dst = i.decode_oid();
+		    r = _clone(cid, src, dst, update_store);
 		}
 		break;
 	    case Transcation::OP_CLONERANGE:
+	    case Transaction::OP_CLONERANGE2:
 		{
 		    /*clone data only ...*/
-		    // FIXME:
-		    // 1) flush converd range of data to backend storage
+		    coll_t cid = i.decode_cid();
+		    ghobject_t src = i.decode_oid();
+		    ghobject_t dst = i.decode_oid();
+		    uint64_t off = i.decode_length();
+		    uint64_t len = i.decode_length();
+		    uint64_t dstoff = off;
+		    if (op == Transaction::OP_CLONERANGE2)
+			dstoff = i.decode_length();
+		    r = _clone_range(cid, src, dst, off, len, dstoff, need_update);
 		}
                 break;
 
          default:
-                if (need_to_update_store(entry_pos))
-                	r = do_other_op(op, i);
+                if (update_store)
+		    r = do_other_op(op, i);
         }
-        ++pos;
     }
 }
 int NVMJournal::do_other_op(int op, Transaction::iterator& p)
@@ -1099,7 +1101,7 @@ int NVMJournal::_truncate(coll_t cid, const ghobject_t &oid, uint32_t off)
         bh->boff = 0;
 
         {
-                RWLock::Locker l(obj->lock);
+                RWLock::WLocker l(obj->lock);
                 merge_new_bh (obj, bh);
                 store->_truncate(cid, oid, (uint64_t)off);
         }
@@ -1123,7 +1125,7 @@ int NVMJournal::_remove(coll_t cid, const ghobject_t& oid)
                 bh->ext.bentry = BufferHead::ZERO;
 
                 {
-                        RWLock::Locker l(obj->lock);
+                        RWLock::WLocker l(obj->lock);
                         merge_new_bh(obj, bh);
                         delete_bh(obj, 0, _ONE_GB, BufferHead::ZERO);
                         obj->stat = Object::REMOVED;
@@ -1153,49 +1155,27 @@ void NVMJournal::put_objects_lock(ObjectRef a, ObjectRef b)
     put_write_lock(a);
     put_write_lock(b);
 }
-// FIXME
+
 int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t *dst, bool update_store)
 {
     CollectionRef coll = get_collection(cid);
-    ObjectRef src_obj = get_object(cid, src);
+    ObjectRef src_obj = get_object(coll, src);
     ObjectRef dst_obj = NULL;
     int ret = 0;
     if(src_obj) {
-	dst_obj = get_object(cid, dst, true);
+	dst_obj = get_object(coll, dst, true);
 	get_objects_lock(src_obj, dst_obj);
     }
 
-    if (update_store) 
-    {
-	if (src_obj && src_obj->stat == Object::DIRTY) 
-	{
+    // flush object to store, then do the store->clone 
+    if (update_store) {
+	if (src_obj && src_obj->stat == Object::DIRTY) {
 	    map<uint32_t, BufferHead *>::iterator p = src_obj->data.begin();
-	    while (p != src_obj->data.end()) 
-	    {
+	    while (p != src_obj->data.end()) {
 		BufferHead *pbh = p->second;
-		uint64_t pos = pbh->bentry;
-		uint64_t off = pbh->ext.start;
-		size_t len = pbh->ext.end - off;
-
-		if (pos == BufferHead::TRUNC) {
-		    /* do nothing */
-		}
-		else if (pos == BufferHead::ZERO) {
-		    store->_zero(cid, oid, off, len);
-		}
-		else {
-		    bool need_to_write = false;
-		    pos = pos << CEPH_PAGE_SHIFT;
-		    if (write_pos >= pos && pos >= data_sync_pos) 
-			need_to_write = true;
-		    else if (!(write_pos < pos && pos < data_sync_pos))
-			need_to_write = true;
-		    if (need_to_write) {
-			/* bufferhead -> store */
-		    }
-		}
-		++ p;
-	    } // while
+		_flush_bh(src_obj, pbh);
+		p ++;
+	    } 
 	    obj->stat = Object::CLEAN;
 	}
 	ret = store->_clone(cid, oid, noid);	
@@ -1252,7 +1232,27 @@ out:
     put_object(dst_obj);
     return ret;
 }
-
+void NVMJournal::_clone_range(coll_t cid, ghobject_t src, ghobject_t dst, 
+	uint64_t off, uint64_t len, uint64_t dst_off, bool need_update_store)
+{
+    ObjectRef obj = get_object(cid, src);
+    if (need_update_store) {
+	if(obj && obj->stat == Object::DIRTY) {
+	    RWLock::RLocker l(obj->lock);
+	    map<uint32_t, BufferHead *>::iterator p = obj->data.find(off);
+	    if (p != obj->data.begin()) 
+		-- p;
+	    uint32_t end = off + len;
+	    while (p != obj->data.end()) {
+		if (p->first >= end)
+		    break;
+		BufferHead *pbh = p->second;
+		_flush_bh (obj, pbh);
+	    }
+	}
+	store->_clone_range(cid, src, dst, off, len, dst_off);
+    }
+}
 void NVMJournal::merge_new_bh(ObjectRef obj, BufferHead* new_bh)
 {
     assert(obj->lock.is_wlocked());
@@ -1689,13 +1689,50 @@ void NVMJournal::check_ev_completion(void)
 	    _sync();
     }
 }
+
+void NVMJournal::_flush_bh(ObjectRef obj, BufferHead *pbh)
+{
+    assert (obj->lock.os_locked());
+    static const int flags = SPLICE_F_NONBLOCK;
+    int *fds = (int *)ThreadLocalPipe.get_value();
+    assert(fds);
+
+    uint64_t pos = pbh->bentry;
+    uint32_t off = pbh->ext.start;
+    uint32_t len = pbh->ext.end - off;
+    if (!len)
+	return;
+    if (pos == BufferHead::TRUNC) {
+	/* do nothing */
+    }
+    else (pos == BufferHead::ZERO) {
+
+    }
+    else {
+	bool need_to_flush = false;
+	 pos = pos << CEPH_PAGE_SHIFT;
+	 if (write_pos >= pos && pos >= data_sync_pos)
+	    need_to_flush = true;
+	else if (!(write_pos < pos && pos < data_sync_pos))
+	    need_to_flush = true;
+	if (need_to_flush) {
+	    loff_t ssd_off = SSD_OFF(pbh);
+	    loff_t obj_off = bh2->ext.start;
+            uint32_t len = bh2->ext.end - bh2->ext.start;
+	    // don't need to worry about the page align problem
+	    // // even though ssd_fd was opened with O_DIRECT
+	    ssize_t r = safe_splice(fd, &ssd_off, fds[1], NULL, len, flags);
+            assert(r == len);
+	    // out_fd = store->open(obj->coll, obj->oid);
+	    // r = safe_splice(fds[0], NULL, out_fd, obj_off, flags);
+	    valid = true;
+	}
+    }
+}
 void NVMJournal::do_ev(Ev *ev, ThreadPool::TPHandle *handle) 
 {
     ObjectRef obj = ev->obj;
     deque<BufferHead *>::iterator p = ev->queue.begin();
-    static const int flags = SPLICE_F_NONBLOCK;
-    int *fds = (int *)ThreadLocalPipe.get_value();
-    assert(fds);
 
     RWLock::WLocker l(obj->lock);
 
@@ -1724,32 +1761,8 @@ void NVMJournal::do_ev(Ev *ev, ThreadPool::TPHandle *handle)
                 && bh2->ext.end > bh->ext.start) 
             {
                 // if bh2 is the child of bh, or bh2 == bh,  then ...
-                if (bh2->bentry == bh->bentry) {
-                    if (bh->bentry != BufferHead::ZERO && bh->bentry == BufferHead::TRUNC)
-                    {
-                        loff_t ssd_off = bh2->bentry << CEPH_PAG E_SHIFT + bh2->boff;
-                        loff_t obj_off = bh2->ext.start;
-                        uint32_t len = bh2->ext.end - bh2->ext.start;
-                        // don't need to worry about the page align problem
-                        // even though ssd_fd was opened with O_DIRECT
-                        ssize_t r = safe_splice(fd, &ssd_off, fds[1], NULL, len, flags);
-                        assert(r == len);
-
-                        // FIXME .../
-                        // out_fd = store->open(obj->coll, obj->oid);
-                        // r = safe_splice(fds[0], NULL, out_fd, obj_off, flags);
-                        valid = true;
-                    }
-                    else if (bh->bentry == BufferHead::ZERO) 
-                    {
-                        // FIXME
-                        // store->zero(obj->coll, obj->oid);
-                    }
-                    else if (bh->bentry == BufferHead::TRUNC)
-                    {
-                        /* do nothing */
-                    }
-                }
+                if (bh2->bentry == bh->bentry)
+                    _flush_bh (obj, bh2);
             }// if 
             ++ t;
         }// while
