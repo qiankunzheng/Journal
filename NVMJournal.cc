@@ -781,14 +781,21 @@ void NVMJournal::erase_object_without_lock(CollectionRef coll, ObjectRef obj)
         coll->Object_map.erase(obj->oid);
 }
 
-void NVMJournal::put_object(ObjectRef obj) 
+void NVMJournal::put_object(ObjectRef obj, bool locked) 
 {
-    assert (obj->lock.is_locked() == false);
     CollectionRef coll = get_collection(obj->coll);
+    if (!locked) 
+        get_coll_lock(obj);
     if (!obj->put()) {
-	    erase_object_with_lock(coll, obj);
+            // you must unlock object before you delete object
+            assert (obj->lock.is_locked() == false);
+	    erase_object_without_lock(coll, obj);
+	    if (obj->parent)
+		put_object(obj->parent, true);
             delete obj;
     }
+    if (!locked) 
+        put_coll_lock(obj);
 }
 
 /* op_wq */
@@ -1097,6 +1104,10 @@ int NVMJournal::_truncate(coll_t cid, const ghobject_t &oid, uint32_t off)
                 store->_truncate(cid, oid, (uint64_t)off);
         }
 
+	{
+	    RWLock::Locker l(Journal_queue_lock);
+	    Journal_queue.push_back (bh);
+	}
         return 0;
 }
 /* _remove */
@@ -1116,7 +1127,6 @@ int NVMJournal::_remove(coll_t cid, const ghobject_t& oid)
                         merge_new_bh(obj, bh);
                         delete_bh(obj, 0, _ONE_GB, BufferHead::ZERO);
                         obj->stat = Object::REMOVED;
-			//store->_remove(cid, oid);
                 }
 
                 delete bh;
@@ -1206,13 +1216,33 @@ int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t *dst,
     if (src_obj && !src_obj->data.empty() && dst_obj) 
     {
 	erase_object_without_lock(coll, src_obj);
-        ObjectRef new_src_obj = get_object(coll, src); // hold ref because of its parent
+        ObjectRef new_src_obj = get_object(coll, src); 
         new_src_obj->parent = src_obj;
         src_obj->get(); // for src_obj's added child
         dst_obj->parent = src_obj;
-        // the ref count equal to the number of child object + number of bufferhead + parent
         src_obj->get(); // for src_obj's added child
-        dst_obj->get(); // for dst_obj's parent
+	
+	// using bufferhead to keep reference of new_src_obj and dst_obj 
+        BufferHead *src_bh, *dst_bh;
+	src_bh = new BufferHead;
+        assert (src_bh);
+	src_bh->owner = new_src_obj;
+        src_bh->ext.start = 0;
+	src_bh->ext.end = 0;
+	src_bh->entry = BufferHead::ZERO;
+	dst_bh = new BufferHead;
+	assert (dst_bh);
+	*dst_bh = *src_bh;
+	dst_bh->owner = dst;
+
+	dst_obj->get(); // for new bufferhead
+	
+	{
+	    Mutex::Locker l(Journal_queue_lock);
+	    Journal_queue.push_back(src_bh);
+	    Journal_queue.push_back(dst_bh);
+	}
+	
     }
 
     put_objects_lock(src_obj, dst_obj);
@@ -1233,6 +1263,8 @@ void NVMJournal::merge_new_bh(ObjectRef obj, BufferHead* new_bh)
 
     uint32_t new_start = new_bh->ext.start;
     uint32_t new_end = new_bh->ext.end;
+    if (new_start == new_end)
+	return;
     while (p != obj->data.end()) {
 	BufferHead *bh = p->second;
 	uint32_t start, end;
@@ -1244,11 +1276,8 @@ void NVMJournal::merge_new_bh(ObjectRef obj, BufferHead* new_bh)
 	    if (end <= new_end) {
 		bh->ext.start = bh->ext.end; // 
 		obj->data.erase(p++);
-		if (!bh->owner) {
-		    // dec the reference of obj
-		    // put_object(obj);
+		if (!bh->owner) 
 		    delete bh;
-		}
 		continue;
 	    }
 	    /* new_start, start, new_end, end */
@@ -1297,10 +1326,9 @@ void NVMJournal::merge_new_bh(ObjectRef obj, BufferHead* new_bh)
 		obj->data[new_end] = right;
 		// obj->get();  
 
-		if (!bh->owner) {
-		    // put_object(obj);
+		if (!bh->owner) 
 		    delete bh;
-		}
+
 		break;	
 	    }
 	}
@@ -1334,97 +1362,103 @@ void NVMJournal::delete_bh(ObjectRef obj, uint32_t off, uint32_t end, uint32_t b
 /* READ */
 #define SSD_OFF(pbh) (((uint64_t)(pbh->bentry) << CEPH_PAGE_SHIFT) + pbh->boff)
 
+void NVMJournal::map_read(ObjectRef obj, uint32_t off, uint32_t end,
+                        map<uint32_t, uint32_t> &hits,
+                        map<uint32_t, uint64_t> &trans,
+                        map<uint32_t, uint32_t> &missing)
+{
+        assert (obj && obj->lock.is_locked());
+        map<uint32_t,BufferHead*>::iterator p = obj->data.lower_bound(off);
+        if (p != obj->data.begin())
+                -- p;
+        while (p != obj->data.end()) 
+        {
+                BufferHead *pbh = p->second;
+                if (pbh->ext.start <= off) {
+                    // _bh_off_, _bh_end_, off, len
+                    if (pbh->ext.end <= off ) {
+                        p++;
+                        continue;
+                    }
+                    // _bh_off_, off, _bh_end_, end
+                    else if (pbh->ext.end < end) 
+                    {
+                        assert(pbh->bentry != BufferHead::TRUNC);
+                        if (pbh->bentry != BufferHead::ZERO )
+                              trans[off] = SSD_OFF(pbh) + (off - pbh->ext.start);
+                        else 
+                              trans[off] = pbh->bentry << CEPH_PAGE_SHIFT;
+
+                        hits[off] = pbh->ext.end - off;
+
+                        off = pbh->ext.end;
+                        p++;
+                        continue;
+                    }
+                    // _bh_off_, off, end, _bh_end_     
+                    else { 
+                        if (pbh->bentry != BufferHead::ZERO && pbh->bentry != BufferHead::TRUNC)
+                              trans[off] = SSD_OFF(pbh) + (off - pbh->ext.start);
+                        else 
+                              trans[off] = pbh->entry << CEPH_PAGE_SHIFT;
+
+                        hits[off] = end - off;
+                        return;
+                    }
+                } 
+                else {
+                    if (end <= pbh->ext.start) {
+                        missing[off] = end - off;
+                        return;
+                    }
+                    // off, _bh_off_, _bh_end_, end OR off, _bh_off_, end, _bh_end_
+                    missing[off] = pbh->ext.start - off;
+                    off = pbh->ext.start;
+                    p ++;
+                }
+        }
+
+    if (off < end)
+        missing[off] = end-off;
+}
+
 void NVMJournal::build_read(coll_t &cid, ghobject_t &oid, uint64_t off, size_t len, ReadOp &op) 
 {
     // keep reference of object
-    op.obj = get_object(cid, oid);
+    ObjectRef obj = get_object(cid, oid);
+    op.obj = obj;
     op.off = off;
     op.length = len;
 
     if (!op.obj) {
-	bufferptr ptr(len);
-	op.miss[off] = len;
+	op.missing[off] = len;
 	return;
     }
 
-    ObjectRef obj = op.obj;
     get_read_lock(obj);
-    map<uint32_t,BufferHead*>::iterator p = obj->data.lower_bound(off);
-    if (p != obj->data.begin())
-	p--;
+    map_read(obj, off, len, op.hits, op.trans, op.missing);
 
-    uint32_t end = off + len;
-
-    while (p != obj->data.end()) {
-	BufferHead *pbh = p->second;
-	if (pbh->ext.start <= off) {
-            // _bh_off_, _bh_end_, off, len
-	    if (pbh->ext.end <= off ) {
-		p++;
-		continue;
-	    }
-            // _bh_off_, off, _bh_end_, end
-	    else if (pbh->ext.end < end) 
-            {
-                assert(pbh->bentry != BufferHead::TRUNC);
-                if (pbh->bentry != BufferHead::ZERO )
-		      op.trans[off] = SSD_OFF(pbh) + (off - pbh->ext.start);
-                else 
-                      op.trans[off] = pbh->bentry << CEPH_PAGE_SHIFT;
-
-		op.hit[off] = pbh->ext.end - off;
-
-		off = pbh->ext.end;
-		p++;
-		continue;
-	    }
-            // _bh_off_, off, end, _bh_end_     
-	    else { 
-                if (pbh->bentry != BufferHead::ZERO && pbh->bentry != BufferHead::TRUNC)
-                      op.trans[off] = SSD_OFF(pbh) + (off - pbh->ext.start);
-                else 
-                      op.trans[off] = pbh->entry << CEPH_PAGE_SHIFT;
-
-		op.hit[off] = end - off;
-		return;
-	    }
-	} 
-        else {
-	    if (end <= pbh->ext.start) {
-		op.miss[off] = end - off;
-		return;
-	    }
-	    // off, _bh_off_, _bh_end_, end OR off, _bh_off_, end, _bh_end_
-	    op.miss[off] = pbh->ext.start - off;
-	    off = pbh->ext.start;
-	    p ++;
-	}
-    }
-
-    if (off < end)
-	op.miss[off] = end-off;
-
-    if (obj->parent && !op.miss.empty()) {
-        ObjectRef parent = obj->parent;
-        build_read_from_parent(parent, obj, op);
-    }
+    if (obj->parent && !op.missing.empty())
+        build_read_from_parent(obj->parent, obj, op);
 }
 void NVMJournal::build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp& op)
 {
-        if (0 == parent)
-                return ;
+        assert (parent);
         if (parent->data.empty())
                 return;
 
-        {
-                get_read_lock(parent);
-                op.parent.push_back(parent);
+        get_read_lock(parent);
+        op.parents.push_back(parent);                
+        map<uint32_t, uint32_t> missing;
                 map<uint32_t, uint32_t>::iterator p = op->miss.begin();
                 while (p != op->miss.end()) {
-
+                        map_read(parent, p->first, p->first+p->second, 
+                                op.hits, op.trans, missing);
+                        p ++;
                 }
 
-                if (parent->parent && op.miss.empty()) {
+                if (parent->parent && missing) {
+                        missing.swap(op.missing);
                         build_read_from_parent(parent->parent, parent, op);
                 }
         }
@@ -1434,8 +1468,8 @@ void NVMJournal::do_read(ReadOp &op)
 {
     map<uint32_t, bufferptr> data;
 
-    for (map<uint32_t, uint32_t>::iterator p = op.hit.begin();
-	    p != op.hit.end(); 
+    for (map<uint32_t, uint32_t>::iterator p = op.hits.begin();
+	    p != op.hits.end(); 
 	    ++p) {
         uint64_t off = op.trans[p->first];
         uint32_t len = p->second;
@@ -1467,15 +1501,15 @@ void NVMJournal::do_read(ReadOp &op)
         } 
     }
 
-    put_read_lock(op.obj);
-    while(!op.parent.empty()) {
-       put_read_lock(op.parent.back());
-       op.parent.pop_back();
+    while(!op.parents.empty()) {
+       put_read_lock(op.parents.front());
+       op.parents.pop_front();
     }
+    put_read_lock(obj);
     put_object(op.obj);
     
-    map<uint32_t, uint32_t>::iterator p = op.miss.begin();
-    while(p != op.miss.end()) {
+    map<uint32_t, uint32_t>::iterator p = op.missing.begin();
+    while(p != op.missing.end()) {
 	// FIXME: should get missing blocks from memstore ...
 	data[p->first] = bufferptr(p->second);
     }
@@ -1791,6 +1825,7 @@ void NVMJournal::do_reclaim()
             RWLock::WLocker locker(obj->lock);
 	    delete_bh(obj, bh->ext.start, bh->ext.end, bh->bentry);
         }
+
 
 	// dec reference of object
 	put_object(obj);

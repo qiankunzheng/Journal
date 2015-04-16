@@ -551,8 +551,19 @@ class NVMJournal : public RWJournal {
 		erase_object_without_lock(coll, obj);
 	}
 
-	void put_object(ObjectRef obj) ;
-	
+	void put_object(ObjectRef obj, bool locked = false) ;
+
+	// we should never try to obtain a lock of an object
+	// when we have got a lock of a collection
+	void get_coll_lock(CollectionRef coll) {
+		assert (coll);
+		coll->lock.Lock();
+	}
+	void put_coll_lock(CollectionRef coll) {
+		assert (coll && coll->lock.is_locked());
+		coll->lock.Unlock();
+
+	}
 	void get_read_lock(ObjectRef obj) {
 	    assert(obj);
 	    obj->lock.get_read();
@@ -581,15 +592,16 @@ class NVMJournal : public RWJournal {
 	struct ReadOp 
 	{
 	    ObjectRef obj;
-            list<ObjectRef> parent;
 	    uint32_t off;
 	    uint32_t length;
 	    bufferlist buf;
 	    // 
-	    map<uint32_t, uint32_t> hit; // off->len 
+	    list<ObjectRef> parents;
+
+	    map<uint32_t, uint32_t> hits; // off->len 
 	    map<uint32_t, uint64_t> trans; // off->ssd_off
 
-	    map<uint32_t, uint32_t> miss; // 
+	    map<uint32_t, uint32_t> missing; // 
 	};
 	void build_read(coll_t &cid, const ghobject_t &oid, uint64_t off, size_t len, ReadOp &op);
 	void build_read_from_parent(ObjectRef parent, ReadOp& op);
