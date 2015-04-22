@@ -1450,18 +1450,15 @@ void NVMJournal::build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp&
         get_read_lock(parent);
         op.parents.push_back(parent);                
         map<uint32_t, uint32_t> missing;
-                map<uint32_t, uint32_t>::iterator p = op->miss.begin();
-                while (p != op->miss.end()) {
-                        map_read(parent, p->first, p->first+p->second, 
-                                op.hits, op.trans, missing);
-                        p ++;
-                }
-
-                if (parent->parent && missing) {
-                        missing.swap(op.missing);
-                        build_read_from_parent(parent->parent, parent, op);
-                }
-        }
+        map<uint32_t, uint32_t>::iterator p = op->miss.begin();
+	while (p != op->miss.end()) {
+	    map_read(parent, p->first, p->first+p->second, 
+		    op.hits, op.trans, missing);
+	    p ++;
+	}
+	missing.swap(op.missing);
+	if (parent->parent && !missing.empty())
+	    build_read_from_parent(parent->parent, parent, op);
 }
 
 void NVMJournal::do_read(ReadOp &op)
@@ -1647,6 +1644,7 @@ void NVMJournal::evict_entry()
 		running_ev.push_back(ev);
 	    }
 	    put_object(obj); // dec reference of object
+	    obj2bh.erase(it++);
 	}
     }
 }
