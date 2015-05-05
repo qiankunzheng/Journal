@@ -47,6 +47,24 @@ class RWJournal {
 
 };
 
+class ThreadLocalStore {
+	pthread_key_t thread_pipe_key;
+	virtual static void release_resource(void *rc);
+	virtual static void *init_resource();
+public:
+	ThreadLocalStore() {
+		pthread_key_create(&thread_pipe_key, release_resource);
+	}
+	void *get_resource() {
+		void *rc = pthread_getspecific(thread_pipe_key);
+		if (!rc) {
+			rc = init_resource();
+			pthread_setspecific (thread_pipe_key, rc);
+		}
+		return rc;
+	}
+};
+
 class NVMJournal : public RWJournal {
 	uint32_t create_crc32(uint32_t *data, int len) {
 		uint32_t crc = 0;
@@ -105,6 +123,7 @@ class NVMJournal : public RWJournal {
 
 	int _open(bool io_direct = true);
 	int _journal_replay(); // replay
+	bool replay;
 
 	class ApplyManager {
 	    bool blocked;
@@ -125,10 +144,6 @@ class NVMJournal : public RWJournal {
 
 	Mutex sync_lock;
 	void _sync(); // update meta.conf on disk
-
-        deque< pair<uint64_t, header> > sync_in_fligths;
-        void _sync_top_half() { }          // create snapshot async
-        void _sync_bottom_half() { }       // waiting for completion of snapshot
 	
     public:
 	int create();
@@ -271,19 +286,10 @@ class NVMJournal : public RWJournal {
 
 	/* thread pool: do op */
 	/* op sequencer */
-	struct Ev; // flushOp
-	struct task {
-	    enum { OP, EV } tag;
-	    void *pt;
-
-	    task(Op *op) :tag(OP), pt(op) { }
-	    task(Ev *op) :tag(EV), pt(op) { }
-	};
-
 	class OpSequencer : public Sequencer_impl {
 	    Mutex lock;
 	    Cond cond;
-	    list<task> tq;
+	    list<Op *> tq;
 	    list<uint64_t> op_q;
 	    list< pair<uint64_t, Context *> > flush_waiters;
 	  public:
@@ -319,9 +325,9 @@ class NVMJournal : public RWJournal {
 		assert(apply_lock.is_locked());
 		return tq.front();
 	    }
-            void queue(const task &t) {
+            void queue(const Op *op) {
                 Mutex::Locker l(lock);  
-                tq.push_back(t);
+                tq.push_back(op);
             }
 	    void dequeue() {
 		Mutex::Locker l(lock);
@@ -390,26 +396,28 @@ class NVMJournal : public RWJournal {
 	    osr->queue(op);
 	    op_wq.queue(osr);
 	}
-	void queue_ev(OpSequencer *osr, Ev *ev) {
-	    osr->queue(task(ev));
-	    op_wq.queue(osr);
-	}
 	void _do_op(OpSequencer *posr, ThreadPool::TPHandle *handle);
 
 	void do_op(Op *op, ThreadPool::TPHandle *handle);
-	void do_ev(Ev *evi, ThreadPool::TPHandle *handle);
 	void do_transaction(Transaction *t, uint64_t seq, uint64_t entry_pos, uint32_t &off);
-	int _touch(coll_t cid, const ghobject_t& oid);
-	int _write(coll_t cid, const ghobject_t& oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff);
-	int _zero(coll_t cid, const ghobject_t& oid, uint32_t off, uint32_t len);
-	int _truncate(coll_t cid, const ghobject_t& oid, uint32_t off);
-	int _remove(coll_t cid, const ghobect_t& oid);
-	int _clone(coll_t cid, const ghobject_t& oid, const ghobject_t& noid, bool flush);
+	int _touch(coll_t cid, const ghobject_t &oid);
+	int _write(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff);
+	int _zero(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len);
+	int _truncate(coll_t cid, const ghobject_t &oid, uint32_t off, bool update_store);
+	int _remove(coll_t cid, const ghobect_t &oid, bool update_store);
+	int _clone(coll_t cid, const ghobject_t &src, const ghobject_t &dst, bool update_store);
+	int _clone_range(coll_t cid, ghobject_t &src, ghobject_t &dst,
+		uint64_t off, uint64_t len, uint64_t dst_off, bool update_store);
+	int _create_collection(cid, bool update_store);
+	int _destroy_collection(cid, bool update_store);
+	int _collection_add(coll_t dst, coll_t src, ghobject_t &oid, bool update_store);
+	int _collection_move_rename(coll_t oldcid, ghobject_t &oldoid, coll_t newcid, ghobject_t &newoid, bool update_store);
+	int _collection_rename(coll_t cid, coll_t ncid, bool update_store);
+	int _spilt_collection(coll_t src, uin32_t bits, uint32_t match, coll_t dst, bool update_store);
 
 	/* memory data structure */
 
 	struct Object;
-	//typedef ceph::shared_ptr<Object> ObjectRef; 
 	typedef Object* ObjectRef;
 
 	struct BufferHead {
@@ -424,103 +432,147 @@ class NVMJournal : public RWJournal {
 	};
 
 	void _flush_bh(ObjectRef obj, BufferHead *pbh);
+	class ThreadLocalPipe: public ThreadLocalStore 
+	{
+		virtual static void *init_resource() {
+			int *fds = new int[2];
+			assert(fds);
+        		assert(::pipe(fds) == 0);
+
+        		::fcntl(fds[1], F_SETPIPE_SZ, 4*1024*1024);
+        		::fcntl(fds[0], F_SETFL, O_NONBLOCK);
+        		::fcntl(fds[1], F_SETFL, O_NONBLOCK);
+        		return (void *)fds;
+		}
+		virtual static void release_resource(void *rc) {
+			if (!rc)
+				return;
+			int *fds = (int *)rc;
+			close (fds[0]);
+			close (fds[1]);
+		}
+	} tls_pipe;
 
 	deque<BufferHead*> Journal_queue;
 	Mutex Journal_queue_lock;
 	Cond Journal_queue_cond;
 
-	deque<BufferHead*> reclaim_queue;
-	Mutex reclaim_queue_lock;
-
-	Mutex waiter_lock; // writer wait for more space... 
-	Cond waiter_cond;
-
-	/* writer will wait on this lock if not enougth space remained in journal */
-	struct Ev {
+	/* writer will wait on this lock if not enougth space remained in journal */	
+	struct EvOp {
 	    uint64_t seq;
 	    uint32_t synced;
-	    ObjectRef obj;	
-            bool done;    
+	    ObjectRef obj;
+	    bool done;
 	    deque<BufferHead *> queue;
-
-	    Ev(ObjectRef o, deque<BufferHead *> q> 
-		: seq(0), synced(0), obj(o), done(false), queue(q) { }
+	    
+	    EvOp(ObjectRef o, deque<BufferHead *> q)
+		: seq(0), synced(0), obj(0), done(false) { }
 	};
 
-	deque<Ev*> running_ev;
 	uint64_t ev_seq;
-	map<uint64_t, deque<BufferHead*> > evicting_bh;
+	map< uint64_t, deque<BufferHead *> > hang_ev;
+	deque<EvOp *> running_ev;
+	deque<EvOp *> ev_queue;
 
-	class TLS {
-	    pthread_key_t thread_pipe_key;
-	    static void put_value(void *value);
+	ThreadPool ev_tp;
+	class EvWQ: public ThreadPool::WorkQueue<EvOp> {
+	    NVMJournal *Journal;
 	public:
-	    TLS();
-	    void* get_value();
-	}ThreadLocalPipe;
+	    EvWQ(time_t timeout, time_t suicide_timeout, ThreadPool *tp, NVMJournal *J) 
+		: ThreadPool::WorkQueue<OpSequencer>("NVMJournal::EvWQ", timeout, suicide_timeout, tp), Journal(J) { }
+	    bool _enqueue(EvOp *op) {
+		Journal->ev_queue.push_back(op);
+		return true;
+	    }
+	    void _dequeue(EvOp *op) {
+		assert(0);
+	    }
+	    bool _empty() {
+		return Journal->ev_queue.empty();
+	    }
+	    EvOp *_dequeue() {
+		if (Journal->ev_queue.empty())
+		    return NULL;
+		EvOp *op = Journal->ev_queue.front();
+		Journal->ev_queue.pop_front();
+		return op;
+	    }
+	    void _process(EvOp *op, ThreadPool::TPHandle *handle) {
+		Journal->_do_ev(op, handle);
+	    }
+	    void _process_finish(EvOp *op) {
+	    }
+	    void _clear() {
+	    	// assert (Journal->op_queue.empty());
+	    }
+	}ev_wq;
+	void queue_ev(EvOp *op) {
+		ev_wq.queue(op);
+	}
 
 	Mutex evict_lock;
 	Cond evict_cond;
+	Mutex waiter_lock;
+	Cond waiter_cond;
 
 	bool should_evict();
 	void wait_for_more_space(uint64_t min);
 	void evict_entry();
-	void check_ev_completion();
+	void update_synced_position(uint32_t synced);
 
+	
 	class JournalEvictor : public Thread {
-		NVMJournal *Journal;
+	    NVMJournal *Journal;
 	public:
-		JournalEvictor(NVMJournal *j) : Journal(j) {	}
-		void *entry() {
-			Journal->evict_entry();
-			return 0;
-		}
-	} evictor;
-	
-	bool ev_stop;
-	void stop_evictor() {
-	    {
-	    	Mutex::Locker locker(evict_lock);
-	    	ev_stop = true;
-	    	evict_cond.Signal();
+	    JournalEvictor(NVMJournal *j) : Journal(j) {	}
+	    void *entry() {
+		Journal->evict_entry();
+		return 0;
 	    }
-	    evictor.join();
-	}
-	
+	} evictor;
+
+	bool ev_stop;
+	uint32_t ev_pause 
+	bool ev_paused;
+	void stop_evictor();
+	void pause_ev_work();
+	void unpause_ev_work();
+
+
+	deque<BufferHead*> reclaim_queue;
+	Mutex reclaim_queue_lock;
 	bool should_relcaim();
 	void do_reclaim();
 
 	struct Object 
 	{
-		coll_t coll;
-		ghobject_t oid;
-		atomic_t ref;
-
-		enum { CLEAN, DIRTY, REMOVED } stat;
-
-		ObjectRef parent;
-		map<uint32_t, BufferHead*> data;
-		RWLock lock;
-
-		Object(coll_t c, ghobject_t o) :
-		    coll(c), oid(o), 
-		    ref(0), 
-		    stat(DIRTY),
-		    lock("NVMJournal::lock"){ }
-
-		void get() { 
-		    ref.inc(); 
-		}
-		uint32_t put() { 
-		    return ref.dec();
-		}
+	    set< pair<coll_t, ghobject_t> > alias;
+	    atomic_t ref;
+	    
+	    ObjectRef parent;
+	    map<uint32_t, BufferHead*> data;
+	    RWLock lock;
+	    
+	    Object(coll_t c, ghobject_t o) :
+		ref(0), 
+		parent(NULL),
+		lock("NVMJournal::lock") {
+		    alias.insert( make_pair(c, o) );
+	    }
+	    
+	    uint32_t get() { return ref.inc(); }
+	    uint32_t put() { return ref.dec(); }
 	};
 
 	struct Collection {
 		ceph::unordered_map<ghobject_t, ObjectRef> Object_hash;
 		map<ghobject_t, ObjectRef> Object_map;
 		OpSequencer *osr;
-		Mutex lock;
+		Mutex lock; 
+		/* ReplicatedPG is already sequencing the reads and writes, 
+		 * the lock is to protect object_map/hash from concurrently access 
+		 * from backend ev/reclaim work and normal operation
+		 */
 
 		Collection(OpSequencer *o) 
 		    : osr(o), 
@@ -529,15 +581,12 @@ class NVMJournal : public RWJournal {
 
 	typedef ceph::shared_ptr<Collection> CollectionRef;
 	
-	struct CacheShard {
-		map<coll_t, CollectionRef> collections;
-		Mutex lock;
-		CacheShard() :
+	struct CollectionMap {
+	    ceph::unordered_mapmap<coll_t, CollectionRef> collections;
+	    Mutex lock;
+	    CollectionMap() :
 		    lock("NVMJournal::CacheShard::lock",false, true, false, g_ceph_context) {}
-	};
-
-	static const uint32_t NR_SLOT = 32;
-	CacheShard Cache[NR_SLOT];
+	} coll_map;
 
 
 	CollectionRef get_collection(coll_t &cid, bool create = false) ;
@@ -545,27 +594,18 @@ class NVMJournal : public RWJournal {
 	ObjectRef get_object(coll_t &cid, const ghobject_t &oid, bool create = false) ;
 	ObjectRef get_object(CollectionRef coll, const ghobject_t &oid, bool create = false);
 
-	inline void erase_object_without_lock(CollectionRef coll, ObjectRef obj) ;
-	void erase_object_with_lock(CollectionRef coll, ObjectRef obj) {
-		if (!coll)
-			return;
-		Mutex::Locker l(coll->lock);
-		erase_object_without_lock(coll, obj);
+	inline void erase_object_with_lock_hold(CollectionRef coll, ghobject_t &obj) ;
+	void erase_object_without_lock(CollectionRef coll, ghobject_t &obj) {
+	    if (!coll)
+		return;
+	    Mutex::Locker l(coll->lock);
+	    erase_object_with_lock_hold(coll, obj);
 	}
 
 	void put_object(ObjectRef obj, bool locked = false) ;
 
 	// we should never try to obtain a lock of an object
 	// when we have got a lock of a collection
-	void get_coll_lock(CollectionRef coll) {
-		assert (coll);
-		coll->lock.Lock();
-	}
-	void put_coll_lock(CollectionRef coll) {
-		assert (coll && coll->lock.is_locked());
-		coll->lock.Unlock();
-
-	}
 	void get_read_lock(ObjectRef obj) {
 	    assert(obj);
 	    obj->lock.get_read();
