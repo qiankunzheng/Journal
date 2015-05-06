@@ -26,7 +26,7 @@
 #include "ObjectStore.h"
 #include "NVMJournal.h"
 
-class MemStore : public ObjectStore {
+class MemStore : public ObjectStore, public BackStore {
 public:
   struct Object {
     bufferlist data;
@@ -292,6 +292,7 @@ public:
     size_t len,
     bufferlist& bl,
     bool allow_eio = false);
+  int _read(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferptr& bp);
   int fiemap(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferlist& bl);
   int getattr(coll_t cid, const ghobject_t& oid, const char *name, bufferptr& value);
   int getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset);

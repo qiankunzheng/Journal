@@ -66,7 +66,7 @@ int NVMJournal::_open(bool io_direct)
 
     if (io_direct) {
         if (aio_ctx_ready) {
-            io_destory(aio_ctx);
+            io_destroy(aio_ctx);
         }
         aio_ctx_ready = false;        
 
@@ -100,7 +100,7 @@ int NVMJournal::mkjournal()
 int NVMJournal::_journal_replay()
 {
     int ret;
-    uint64_t seq, pos = sync_data_pos;
+    uint64_t seq, pos = data_sync_pos;
     Op op;
     replay = true;
     do {
@@ -110,8 +110,6 @@ int NVMJournal::_journal_replay()
 	    write_pos = pos;
 	    cur_seq = seq;
 	}
-        if (write_pos >= meta_sync_pos)
-            replay = false;
     } while(!ret);
     replay = false;
     return 0;
@@ -161,7 +159,7 @@ int NVMJournal::create()
    direct = true;
    r = _open(true);
    if (r)
-        retuurn r; 
+        return r; 
 
    if (zero_buf)
         delete[] zero_buf;
@@ -233,14 +231,22 @@ void NVMJournal::_sync()
     apply_manager.sync_finish();
     op_tp.unpause();
 }
-// FIXME
-NVMJournal::NVMJournal(string dev, string c, MemStore *s, Finisher *fin)
+NVMJournal::NVMJournal(string dev, string c, BackStore *s, Finisher *fin)
     :RWJournal (s, fin), 
+    write_pos(0),
+    meta_sync_pos(0),
+    data_sync_pos(0),
+    data_sync_pos_recorded(0),
+    start_pos(0),
+    max_length(0),
     path (dev), conf (c), fd(-1),
+    replay(false),
+    sync_lock ("NVMJournal::sync_lock", false, true, false, g_ceph_context),
     writeq_lock ("NVMJournal::writeq_lock", false, true, false, g_ceph_context),
-    op_throttle_lock("NVMJournal::op_throttle_lock", false, true, false, g_ceph_context),
-    op_qeueu_len(0),
+    op_throttle_lock ("NVMJournal::op_throttle_lock", false, true, false, g_ceph_context),
+    op_queue_len(0),
     aioq_lock ("NVMJournal::aioq_lock",false, true, false, g_ceph_context), 
+    aio_num(0),
     aio_ctx(0), 
     aio_ctx_ready(false),
     zero_buf (NULL), 
@@ -253,12 +259,16 @@ NVMJournal::NVMJournal(string dev, string c, MemStore *s, Finisher *fin)
     op_tp (g_ceph_context, "NVMJournal::op_tp", g_conf->filestore_op_threads, "filestore_op_threads"),
     op_wq (0, 0, &op_tp, this),
     Journal_queue_lock ("NVMJournal::Journal_queue_lock", false, true, false, g_ceph_context),
-    reclaim_queue_lock ("NVMJournal::reclaim_queue_lock", false, true, false, g_ceph_context),
-    waiter_lock ("NVMJournal::waiter_lock",false, true, false, g_ceph_context),
     ev_seq(0),
+    ev_tp (g_ceph_context, "NVMJournal::ev_tp", g_conf->filestore_op_threads, "filestore_op_threads"),
+    ev_wq (0, 0, &ev_tp, this),
+    evict_lock ("NVMJournal::evict_lock", false, true, false, g_ceph_context),
+    waiter_lock ("NVMJournal::Waiter_lock", false, true, false, g_ceph_context),
     evictor(this),
     ev_stop(false),
-    evict_lock("NVMJournal::evict_lock", false, true, false, g_ceph_context)
+    ev_pause(0),
+    ev_paused(false),
+    reclaim_queue_lock ("NVMJournal::reclaim_queue_lock", false, true, false, g_ceph_context)
 {
 }
 NVMJournal::~NVMJournal() 
@@ -307,7 +317,7 @@ void NVMJournal::submit_entry(Sequencer *posr, list<Transaction*> &tls, ThreadPo
 	    posr->p = osr;
 	}
 
-	osr->register_op(cur);
+	osr->register_op(cur_seq);
 	writeq.push_back(write_item(cur_seq++, osr, tls));
     }
     writeq_cond.Signal();
@@ -318,7 +328,7 @@ uint64_t NVMJournal::prepare_single_write(bufferlist &meta, bufferlist &data, Op
     write_item *pitem;       
     uint64_t seq = 0; 
     bufferlist tmeta, tdata;
-    uint32_t meta_len, data_len, pre_pad, size;
+    uint32_t meta_len, data_len, pre_pad = 0, size;
 
     {
     	Mutex::Locker locker(writeq_lock); // check tailer and header of journal entry
@@ -472,7 +482,8 @@ int NVMJournal::read_entry(uint64_t &pos, uint64_t &next_seq, Op *op)
     if (h.wrap) {
     	assert(h.seq == 0);
     	entry_header_t h2;
-    	safe_pread(fd, &h2, sizeof(h2), pos);
+    	ssize_t r = safe_pread(fd, &h2, sizeof(h2), pos);
+        assert(r == sizeof(h2));
     	if (memcmp(&h,&h2,sizeof(h)))
     		return -1;
     	pos = 0;
@@ -482,12 +493,14 @@ int NVMJournal::read_entry(uint64_t &pos, uint64_t &next_seq, Op *op)
     off = sizeof(h) + h.pre_pad + size; // offset of data part
     bufferptr bp = buffer::create(size);
  
-    safe_pread(fd, bp.c_str(), size, pos);
+    cnt = safe_pread(fd, bp.c_str(), size, pos);
+    assert (cnt == size);
     bl.push_back(bp);
    
     entry_header_t h2;
     pos += h.length + h.post_pad;
-    safe_pread(fd, &h2, sizeof(h2), pos);
+    cnt = safe_pread(fd, &h2, sizeof(h2), pos);
+    assert (cnt == sizeof(h2));
     if (memcmp(&h, &h2, sizeof(h)))
 	return -1;
     pos += sizeof(h);
@@ -506,7 +519,7 @@ int NVMJournal::read_entry(uint64_t &pos, uint64_t &next_seq, Op *op)
     // next_seq >= h.seq+1
     next_seq = h.seq + 1;
 
-    for (int n = 0; n < h.ops; n++) {
+    for (uint32_t n = 0; n < h.ops; n++) {
         bufferlist ts;
         ::decode(ts, p);
         bufferlist::iterator t = ts.begin();
@@ -733,16 +746,16 @@ void NVMJournal::notify_on_applied(Op *op)
 	finisher->queue(onreadable);
 }
 /* object */
-NVMJournal::CollectionRef NVMJournal::get_collection(coll_t &cid, bool create) 
+NVMJournal::CollectionRef NVMJournal::get_collection(coll_t cid, bool create) 
 {
     Mutex::Locker locker(coll_map.lock);
-    map<coll_t, CollectionRef>::iterator itr = coll_map.collections.find(cid);
+    ceph::unordered_map<coll_t, CollectionRef>::iterator itr = coll_map.collections.find(cid);
     if(itr == coll_map.collections.end()) {
 	if (!create)
 	    return CollectionRef();
-	if (!replay && store->_collection_exists(cid))
+	if (!replay && store->collection_exists(cid))
 	    return CollectionRef();
-	coll_map.collections[cid].reset(new Collection(osr));
+	coll_map.collections[cid].reset(new Collection(cid));
     }
     return coll_map.collections[cid];
 }
@@ -755,19 +768,19 @@ NVMJournal::ObjectRef NVMJournal::get_object(CollectionRef coll, const ghobject_
         if (p == coll->Object_hash.end()) {
 	    if (!create)
 		return NULL;
-            obj = new Object(cid, oid);
+            obj = new Object(coll->cid, oid);
             coll->Object_hash[oid] = obj;
             coll->Object_map[oid] = obj;
 	    if (!replay)
-		store->_touch(coid, oid);
+		store->_touch(coll->cid, oid);
         }
               
-        ObjectRef obj = coll->Object_hash[oid];
+        obj = coll->Object_hash[oid];
         obj->get();
         return obj;
 }
 
-NVMJournal::ObjectRef NVMJournal::get_object(coll_t &cid, const ghobject_t &oid, bool create) 
+NVMJournal::ObjectRef NVMJournal::get_object(coll_t cid, const ghobject_t &oid, bool create) 
 {
     CollectionRef coll;
     coll = get_collection(cid, create);
@@ -776,7 +789,7 @@ NVMJournal::ObjectRef NVMJournal::get_object(coll_t &cid, const ghobject_t &oid,
     return get_object(coll, oid, create);
 }
 
-void NVMJournal::erase_object_with_lock_hold (CollectionRef coll, ghobject_t &oid)
+void NVMJournal::erase_object_with_lock_hold (CollectionRef coll, const ghobject_t &oid)
 {
         assert (coll);
         coll->Object_hash.erase(oid);
@@ -796,20 +809,22 @@ void NVMJournal::put_object(ObjectRef obj, bool locked)
 	assert (obj->lock.is_locked() == false);
 	map< CollectionRef, shared_ptr<Mutex::Locker> > lockers;
 	{
-	    RWLocker::RLocker l (obj->lock);
+	    RWLock::RLocker l (obj->lock);
 	    set< pair<coll_t, ghobject_t> >::iterator p = obj->alias.begin();
 	    while (p != obj->alias.end()) {
 		CollectionRef c = get_collection(p->first);
 		if (lockers.count(c) == 0)
-		    lockers[c] = make_shared<Mutex::Locker>(c->lock);
+		    lockers[c] = shared_ptr<Mutex::Locker>(new Mutex::Locker(c->lock));
 		++ p;
 	    }
 	}
 	if (0 == obj->put()) {
 	    put_object(obj->parent);
-	    for (p = obj->alias.begin(); p != obj->alias.end(); p++) {
+	    for (set< pair<coll_t, ghobject_t> >::iterator p = obj->alias.begin(); 
+                        p != obj->alias.end(); 
+                        ++p ) {
 		CollectionRef coll = get_collection(p->first);
-		erase_object_with_lock_hold (coll, o->second);
+		erase_object_with_lock_hold (coll, p->second);
 	    }
 	   obj->alias.clear();
 	}
@@ -861,14 +876,14 @@ bool NVMJournal::need_to_update_store(uint64_t entry_pos)
     	return false;
     if (!(meta_sync_pos < entry_pos && entry_pos < start_pos))
     	return false;
+    replay = false;
     return true;
 }
 // FIXME
 void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos, uint32_t &offset) 
 { 
-    bool update_store = need_to_updaate_store(entry_pos);
+    bool update_store = need_to_update_store(entry_pos);
     Transaction::iterator i = t->begin();
-    int r = 0;
     while (i.have_op()) {
 	int op = i.decode_op();
 	int r = 0;
@@ -889,8 +904,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         coll_t cid = i.decode_cid();
                         ghobject_t oid = i.decode_oid();
                         /* do nothing */
-                        if(need_update)
-                        	r = _touch(cid, oid);
+                        _touch(cid, oid);
                 }
                 break;
 	    case Transaction::OP_WRITE:
@@ -931,7 +945,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         uint64_t off = i.decode_length();
                         // create a special bufferhead which stand for trun,
                         // and commit to backend storage later
-                        r = _truncate(cid, oid, off);
+                        r = _truncate(cid, oid, off, update_store);
                 }
                 break;
             case Transaction::OP_REMOVE:
@@ -940,9 +954,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
                         ghobject_t oid = i.decode_oid();
                         // SET object.stat to REMOVED
                         // and call store->_remove(cid, oid)
-                        r = _remove (cid, oid);
-                        if (need_update)
-                            r = store->_remove(cid, oid);
+                        r = _remove (cid, oid, update_store);
                 }
                 break;
 	   
@@ -955,7 +967,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
 		    r = _clone(cid, src, dst, update_store);
 		}
 		break;
-	    case Transcation::OP_CLONERANGE:
+	    case Transaction::OP_CLONERANGE:
 	    case Transaction::OP_CLONERANGE2:
 		{
 		    /*clone data only ...*/
@@ -967,7 +979,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
 		    uint64_t dstoff = off;
 		    if (op == Transaction::OP_CLONERANGE2)
 			dstoff = i.decode_length();
-		    r = _clone_range(cid, src, dst, off, len, dstoff, need_update);
+		    r = _clone_range(cid, src, dst, off, len, dstoff, update_store);
 		}
                 break;
 	    case Transaction::OP_MKCOLL:
@@ -979,7 +991,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
 	    case Transaction::OP_RMCOLL:
 		{
 		    coll_t cid = i.decode_cid();
-		    r = _destory_collection(cid, update_store);
+		    r = _destroy_collection(cid, update_store);
 		}
 		break;
 	    case Transaction::OP_COLL_ADD:
@@ -1004,7 +1016,7 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
 	    case Transaction::OP_COLL_MOVE_RENAME:
 		{
 		    coll_t oldcid = i.decode_cid();
-		    ghobject_t oldoid = i.decide_oid();
+		    ghobject_t oldoid = i.decode_oid();
 		    coll_t newcid = i.decode_cid();
 		    ghobject_t newoid = i.decode_oid();
 		    r = _collection_move_rename(oldcid, oldoid, newcid, newoid, update_store);
@@ -1026,21 +1038,22 @@ void NVMJournal::do_transaction(Transaction* t, uint64_t seq, uint64_t entry_pos
 		    uint32_t bits = i.decode_u32();
 		    uint32_t rem = i.decode_u32();
 		    coll_t dest = i.decode_cid();
-		    r = _split_collection(cid, bits, rem, dest);
+		    r = _split_collection(cid, bits, rem, dest, update_store);
 		}
 		break;
          default:
                 if (update_store)
 		    r = do_other_op(op, i);
         }
+        assert(r == 0);
     }
 }
-int NVMJournal::do_other_op(int op, Transaction::iterator& p)
+int NVMJournal::do_other_op(int op, Transaction::iterator& i)
 {
-    int r;
+    int r = 0 ;
     switch(op)   /* deal with the attributes of objects */
     {
-	case Transation::OP_SETATTR: 
+	case Transaction::OP_SETATTR: 
 	    {
 		coll_t cid = i.decode_cid();
 		ghobject_t oid = i.decode_oid();
@@ -1049,7 +1062,7 @@ int NVMJournal::do_other_op(int op, Transaction::iterator& p)
 		i.decode_bl(bl);
 		map<string, bufferptr> to_set;
 		to_set[name] = bufferptr(bl.c_str(), bl.length());
-		r = store->setattrs(cid, oid, to_set);
+		r = store->_setattrs(cid, oid, to_set);
             }
 	    break;
 	case Transaction::OP_SETATTRS:
@@ -1058,7 +1071,7 @@ int NVMJournal::do_other_op(int op, Transaction::iterator& p)
 		ghobject_t oid = i.decode_oid();
 		map<string, bufferptr> aset;
 		i.decode_attrset(aset);
-		r = store->_setattrs();
+		r = store->_setattrs(cid, oid, aset);
 	    }
 	    break;
         case Transaction::OP_RMATTR:
@@ -1081,7 +1094,7 @@ int NVMJournal::do_other_op(int op, Transaction::iterator& p)
 		coll_t cid = i.decode_cid();
                 uint32_t type = i.decode_u32();
                 bufferlist hint;
-                i.decode_bh(hint);
+                i.decode_bl(hint);
                 bufferlist::iterator pitr = hint.begin();
 		if (type == Transaction::COLL_HINT_EXPECTED_NUM_OBJECTS) {
 		    uint32_t pg_num;
@@ -1112,7 +1125,7 @@ int NVMJournal::do_other_op(int op, Transaction::iterator& p)
 	    {
 		coll_t cid = i.decode_cid();
 		ghobject_t oid = i.decode_oid();
-		r = store->__omap_clear();
+		r = store->_omap_clear(cid, oid);
 	    }
 	    break;
 	case Transaction::OP_OMAP_SETKEYS:
@@ -1127,22 +1140,22 @@ int NVMJournal::do_other_op(int op, Transaction::iterator& p)
 	case Transaction::OP_OMAP_RMKEYS:
 	    {
 		coll_t cid = i.decode_cid();
-		ghobject_t oid - i.decode_oid();
+		ghobject_t oid = i.decode_oid();
 		set<string> keys;
 		i.decode_keyset(keys);
 		r = store->_omap_rmkeys(cid, oid, keys);
 	    }
 	    break;
-	case Transaction::OP_OMAP_RMKEYRANGES:
+	case Transaction::OP_OMAP_RMKEYRANGE:
 	    {
 		coll_t cid = i.decode_cid();
 		ghobject_t oid = i.decode_oid();
 		string first = i.decode_key();
 		string last = i.decode_key();
-		r = store->_omap_rmkekyrange(cid, oid, first, last);
+		r = store->_omap_rmkeyrange(cid, oid, first, last);
 	    }
 	    break;
-	case Trasaction::OP_OMAP_SETHEADER:
+	case Transaction::OP_OMAP_SETHEADER:
 	    {
 		coll_t cid = i.decode_cid();
 		ghobject_t oid = i.decode_oid();
@@ -1159,13 +1172,13 @@ int NVMJournal::do_other_op(int op, Transaction::iterator& p)
 		i.decode_length();
 	    }
 	    break;
-	deafult:
-	    derr << "bad op " << op << endl;
+	default:
+	    derr << "bad op " << op << dendl;
 	    assert(0);
     }
     return r;
 }
-int NVMJournal::_touch(coll_t cid, ghobject_t oid)
+int NVMJournal::_touch(coll_t cid, const ghobject_t &oid)
 {
     // make sure the existance of object in the backend storage
     return store->_touch(cid, oid);
@@ -1225,7 +1238,7 @@ int NVMJournal::_zero(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t 
     }
     return 0;
 }
-define _ONE_GB	(1024*1024*1024)
+#define _ONE_GB	(1024*1024*1024)
 /* do truncate */
 int NVMJournal::_truncate(coll_t cid, const ghobject_t &oid, uint32_t off, bool update_store)
 {
@@ -1248,7 +1261,7 @@ int NVMJournal::_truncate(coll_t cid, const ghobject_t &oid, uint32_t off, bool 
 	    store->_truncate(cid, oid, (uint64_t)off);
 	
 	{
-	    RWLock::Locker l(Journal_queue_lock);
+	    Mutex::Locker l(Journal_queue_lock);
 	    Journal_queue.push_back (bh);
 	}
         return 0;
@@ -1290,7 +1303,7 @@ int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t &dst,
 
     // flush object to store, then do the store->clone 
     if (update_store) {
-	if (sro) {
+	if (srco) {
 	    RWLock::RLocker l(srco->lock);
 	    map<uint32_t, BufferHead *>::iterator p = srco->data.begin();
 	    while (p != srco->data.end()) {
@@ -1299,12 +1312,14 @@ int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t &dst,
 		p ++;
 	    } 
 	}
-	ret = store->_clone(cid, oid, noid);	
+	ret = store->_clone(cid, src, dst);	
     }
     
-    if (ret != 0)
-        goto out;
-
+    if (ret != 0) {
+        put_object(srco);
+        put_object(dsto);
+        return ret;
+    }
     // create a new_src_object whose parent is src_object
     // src_object is a readonly object now, the dst object and new src object
     // share iis data1
@@ -1316,10 +1331,10 @@ int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t &dst,
     
     map< CollectionRef, shared_ptr<Mutex::Locker> >lockers;
     set< pair<coll_t, ghobject_t> >::iterator p = srco->alias.begin();
-    while (p != obj->alias.end()) {
+    while (p != srco->alias.end()) {
 	CollectionRef c = get_collection(p->first);
 	if (lockers.find(c) == lockers.end())
-	    lockers[c] = make_shared<Mutex::Locker>(c->lock);
+	    lockers[c] = shared_ptr<Mutex::Locker>(new Mutex::Locker(c->lock));
 	++ p;
     }
 
@@ -1349,7 +1364,7 @@ int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t &dst,
 	src_bh->owner = new_srco;
         src_bh->ext.start = 0;
 	src_bh->ext.end = 0;
-	src_bh->entry = BufferHead::ZERO;
+	src_bh->bentry = BufferHead::ZERO;
 	dst_bh = new BufferHead;
 	assert (dst_bh);
 	*dst_bh = *src_bh;
@@ -1365,7 +1380,6 @@ int NVMJournal::_clone(coll_t cid, const ghobject_t& src, const ghobject_t &dst,
 	
     }
 
-out:
     put_object(srco);
     put_object(dsto);
     return ret;
@@ -1419,24 +1433,24 @@ int NVMJournal::_clone_range(coll_t cid, ghobject_t &src, ghobject_t &dst,
     put_object(dsto);
     return ret;
 }
-int NVMJournal::_create_collection(cid, bool update_store)
+int NVMJournal::_create_collection(coll_t cid, bool update_store)
 {
     int r = 0;
     if (update_store)
 	r = store->_create_collection(cid);
     return r;
 }
-int NVMJournal::_destory_collection(cid, bool update_store)
+int NVMJournal::_destroy_collection(coll_t cid, bool update_store)
 {
     int ret = 1;
     {
 	Mutex::Locker locker(coll_map.lock);
-	map<coll_t, CollectionRef>::iterator itr = coll_map.collections.find(cid);
+	ceph::unordered_map<coll_t, CollectionRef>::iterator itr = coll_map.collections.find(cid);
 	if (itr != coll_map.collections.end()) {
 	    CollectionRef c = itr->second;
 	    Mutex::Locker l(c->lock); 
 	    if (c->Object_hash.empty()) {
-		cs.collections.erase(itr);
+		coll_map.collections.erase(itr);
 		ret = 0;
 	    }
 	}
@@ -1445,11 +1459,11 @@ int NVMJournal::_destory_collection(cid, bool update_store)
     }
 
     if (ret && update_store)
-	ret = store->_destory_collection(cid);
+	ret = store->_destroy_collection(cid);
     return ret;
 
 }
-int NVMJournal::_collection_add(coll_t dst, coll_t src, ghobject_t &oid, bool update_store)
+int NVMJournal::_collection_add(coll_t dst, coll_t src, const ghobject_t &oid, bool update_store)
 {
     int ret = 0;
     ObjectRef obj = get_object(src, oid);
@@ -1459,37 +1473,37 @@ int NVMJournal::_collection_add(coll_t dst, coll_t src, ghobject_t &oid, bool up
 	RWLock::WLocker l1 (obj->lock);
 	{
 	    Mutex::Locker l2 (dstc->lock);
-	    dst->Object_hash[oid] = obj;
-	    dst->Object_map[oid] = obj;
+	    dstc->Object_hash[oid] = obj;
+	    dstc->Object_map[oid] = obj;
 	}
-	obj->alias.insert( make_pair(dsro, oid));
+	obj->alias.insert( make_pair(dst, oid));
     }
     if (update_store)
 	ret = store->_collection_add(dst, src, oid);
     return ret;
 }
 
-int NVMJournal::_collection_move_rename(coll_t oldcid, ghobject_t &oldoid,
-	coll_t newcid, ghobject_t &newoid, bool update_store)
+int NVMJournal::_collection_move_rename(coll_t oldcid, const ghobject_t &oldoid,
+	coll_t newcid, const ghobject_t &newoid, bool update_store)
 {
     int ret = 0;
     CollectionRef srcc = get_collection(oldcid);
     if (srcc) {
-	CollectionRef dstc = get_collection(newcid, ture);
+	CollectionRef dstc = get_collection(newcid, true);
 	assert(dstc);
 	ObjectRef obj = get_object(srcc, oldoid);
 	RWLock::WLocker locker (obj->lock);
 	if (obj) {
 	    if (srcc != dstc) {
-		Mutex::Locker l1 (MIN(srcc, dstc)->lock);
-		Mutex::Locker l2 (MAX(srcc, dstc)->lock);
+		Mutex::Locker l1 (MIN(&(*srcc), &(*dstc))->lock);
+		Mutex::Locker l2 (MAX(&(*srcc), &(*dstc))->lock);
 		erase_object_with_lock_hold(srcc, oldoid);
 		dstc->Object_hash[newoid] = obj;
 		dstc->Object_map[newoid] = obj;
 	    }
 	    else {
 		Mutex::Locker l (srcc->lock);
-		erase_object_with_lock_hold(src, oldoid);
+		erase_object_with_lock_hold(srcc, oldoid);
 		srcc->Object_hash[newoid] = obj;
 		srcc->Object_map[newoid] = obj;
 	    }
@@ -1507,19 +1521,19 @@ int NVMJournal::_collection_rename(coll_t cid, coll_t ncid, bool update_store)
     CollectionRef coll = get_collection(cid);
     // we should pause evict here...
     pause_ev_work();
-    if (srcc) {
+    if (coll) {
 	{
 	    Mutex::Locker l(coll_map.lock);
-	    coll_map.collection[ncid] = coll;
-	    coll_map.collection.erase(cid);
+	    coll_map.collections[ncid] = coll;
+	    coll_map.collections.erase(cid);
 	}
 	// update the alias of each object 
 	for (map<ghobject_t, ObjectRef>::iterator itr = coll->Object_map.begin();
 		itr != coll->Object_map.end();
 		++itr) {
 	    ObjectRef o = itr->second;
-	    o->alias.erase( make_pair(cid, p->first));
-	    o->alias.insert( make_pair(ncid, p->second));
+	    o->alias.erase( make_pair(cid, itr->first));
+	    o->alias.insert( make_pair(ncid, itr->first));
 	}
     }
     if (update_store)
@@ -1538,10 +1552,10 @@ int NVMJournal::_split_collection(coll_t src, uint32_t bits, uint32_t match, col
 	while (p != srcc->Object_map.end())
 	{
 	    if (p->first.match(bits, match)) {
-		ObjectRef obj = o->second;
+		ObjectRef obj = p->second;
 		srcc->Object_hash.erase(p->first);
 		dstc->Object_hash[p->first] = obj;
-		dsrc->Object_map[p->first] = obj;
+		dstc->Object_map[p->first] = obj;
 		// update the alias of object
 		obj->alias.insert( make_pair(dst, p->first));
 		obj->alias.erase( make_pair(src, p->first));
@@ -1554,6 +1568,7 @@ int NVMJournal::_split_collection(coll_t src, uint32_t bits, uint32_t match, col
     if (update_store)
 	ret = store->_split_collection(src, bits, match, dst);
     unpause_ev_work();
+    return ret;
 }
 void NVMJournal::merge_new_bh(ObjectRef obj, BufferHead* new_bh)
 {
@@ -1702,7 +1717,7 @@ void NVMJournal::map_read(ObjectRef obj, uint32_t off, uint32_t end,
                         if (pbh->bentry != BufferHead::ZERO && pbh->bentry != BufferHead::TRUNC)
                               trans[off] = SSD_OFF(pbh) + (off - pbh->ext.start);
                         else 
-                              trans[off] = pbh->entry << CEPH_PAGE_SHIFT;
+                              trans[off] = pbh->bentry << CEPH_PAGE_SHIFT;
 
                         hits[off] = end - off;
                         return;
@@ -1724,25 +1739,28 @@ void NVMJournal::map_read(ObjectRef obj, uint32_t off, uint32_t end,
         missing[off] = end-off;
 }
 
-void NVMJournal::build_read(coll_t &cid, ghobject_t &oid, uint64_t off, size_t len, ReadOp &op) 
+void NVMJournal::build_read(coll_t &cid, const ghobject_t &oid, uint64_t off, size_t len, ReadOp &op) 
 {
     // keep reference of object
     uint32_t attempts = 4;
+    ObjectRef obj = NULL;
     do {
-	ObjectRef obj = get_object(cid, oid);
+	obj = get_object(cid, oid);
 	if (!obj) 
 	    break;
 	get_read_lock(obj);
 	if (!obj->alias.empty())
 	    break;
 	put_object(obj);
-    } while(attemps--);
+    } while(attempts--);
 
+    op.cid = cid;
+    op.oid = oid;
     op.obj = obj;
     op.off = off;
     op.length = len;
 
-    if (!op.obj || obh->alias.empty()) {
+    if (!op.obj || obj->alias.empty()) {
 	op.missing[off] = len;
 	return;
     }
@@ -1761,8 +1779,8 @@ void NVMJournal::build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp&
         get_read_lock(parent);
         op.parents.push_back(parent);                
         map<uint32_t, uint32_t> missing;
-        map<uint32_t, uint32_t>::iterator p = op->miss.begin();
-	while (p != op->miss.end()) {
+        map<uint32_t, uint32_t>::iterator p = op.missing.begin();
+	while (p != op.missing.end()) {
 	    map_read(parent, p->first, p->first+p->second, 
 		    op.hits, op.trans, missing);
 	    p ++;
@@ -1772,10 +1790,12 @@ void NVMJournal::build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp&
 	    build_read_from_parent(parent->parent, parent, op);
 }
 
-void NVMJournal::do_read(ReadOp &op)
+int NVMJournal::do_read(ReadOp &op)
 {
-    map<uint32_t, bufferptr> data;
+    if (!store->exists(op.cid, op.oid))
+        return -ENOENT;
 
+    map<uint32_t, bufferptr> data;
     for (map<uint32_t, uint32_t>::iterator p = op.hits.begin();
 	    p != op.hits.end(); 
 	    ++p) {
@@ -1797,13 +1817,13 @@ void NVMJournal::do_read(ReadOp &op)
         } 
         else if (bentry == BufferHead::ZERO) {
             bufferptr bp(len);
-            pb.zero();
-            data[p->front] = bp;
+            bp.zero();
+            data[p->first] = bp;
         }
         else {
 	    map<uint32_t, uint32_t>::iterator next = p;
 	    ++ next;
-	    assert(next == op.hit.end());
+	    assert(next == op.hits.end());
             assert(bentry == BufferHead::TRUNC);
             /* do nothing */
         } 
@@ -1813,13 +1833,32 @@ void NVMJournal::do_read(ReadOp &op)
        put_read_lock(op.parents.front());
        op.parents.pop_front();
     }
-    put_read_lock(obj);
-    put_object(op.obj);
+    
+    if (op.obj) {
+        put_read_lock(op.obj);
+        put_object(op.obj);
+    }
     
     map<uint32_t, uint32_t>::iterator p = op.missing.begin();
     while(p != op.missing.end()) {
-	// FIXME: should get missing blocks from memstore ...
-	data[p->first] = bufferptr(p->second);
+	bufferptr ptr(p->second);
+        ssize_t r = store->_read(op.cid, op.oid, p->first, p->second, ptr);
+        if (r < p->second) {
+            data[p->first] = ptr;
+            ++ p;
+            while (p != op.missing.end() 
+                && p->second < op.obj->size) {
+                uint32_t len = op.obj->size - p->first;
+                if (len > p->second)
+                        len = p->second;
+                bufferptr ptr(len);
+                memset(ptr.c_str(), 0, len);
+                data[p->first] = ptr;
+            }     
+            break;
+        }
+        data[p->first] = ptr;
+        ++p;
     }
 
     map<uint32_t, bufferptr>::iterator q = data.begin();
@@ -1827,15 +1866,17 @@ void NVMJournal::do_read(ReadOp &op)
 	op.buf.append(p->second);
 	++ q;
     }
+    return 0;
 }
 
-void NVMJournal::read_object(coll_t &cid, ghobject_t &oid, uint64_t off, size_t& len, bufferlist &buf)
+int NVMJournal::read_object(coll_t cid, const ghobject_t &oid, uint64_t off, size_t len, bufferlist &bl)
 {
     ReadOp op;
     build_read(cid, oid, off, len, op);
-    do_read(op);
-    buf.swap(op.buf);
-    len = buf.length();
+    int r = do_read(op);
+    bl.swap(op.buf);
+    len = bl.length();
+    return r;
 }
 
 
@@ -1903,20 +1944,20 @@ void NVMJournal::evict_entry()
         // reserve the evict op
         apply_manager.op_apply_start(ops);
 
-	map<ObjectRef, deque<BufferHead *> >::iterator p = obj2bh.begin();
+	map<ObjectRef, deque<BufferHead *> >::iterator itr = obj2bh.begin();
 
-	while (p != obj2bh.end()) 
+	while (itr != obj2bh.end()) 
 	{
-                ObjectRef obj = p->first;
-                EvOp *ev = new EvOp(obj, p->second);
+                ObjectRef obj = itr->first;
+                EvOp *ev = new EvOp(obj, itr->second);
                 assert(ev);
                 if (ops == 1) {
                         ev->synced = synced;
                         ev->seq = seq;
                 }
                 queue_ev(ev);
-                running_ev.push_back();
-                ++ p;
+                running_ev.push_back(ev);
+                ++ itr;
                 -- ops;               
 	}
         obj2bh.clear();
@@ -1952,9 +1993,9 @@ void NVMJournal::check_ev_completion()
 {
     uint64_t new_completed_ev = 0;
     uint32_t new_synced = 0;
-    deque<Ev*>::iterator it = running_ev.begin();
+    deque<EvOp*>::iterator it = running_ev.begin();
     while (it != running_ev.end() && (*it)->done) {
-        Ev *ev = *it;
+        EvOp *ev = *it;
         if (ev->seq) {
             new_completed_ev = ev->seq;
             new_synced = ev->synced;
@@ -1964,7 +2005,7 @@ void NVMJournal::check_ev_completion()
     }
 
     if (new_completed_ev) {
-        Mutex::Locker l(reclaim_lock);
+        Mutex::Locker l(reclaim_queue_lock);
         map<uint64_t, deque<BufferHead*> >::iterator p = hang_ev.begin();
         while (p->first <= new_completed_ev) {
                 reclaim_queue.insert(reclaim_queue.end(), p->second.begin(), p->second.end());
@@ -1988,7 +2029,7 @@ void NVMJournal::check_ev_completion()
 
 void NVMJournal::_flush_bh(ObjectRef obj, BufferHead *pbh)
 {
-    assert (obj->lock.os_locked());
+    assert (obj->lock.is_locked());
     static const int flags = SPLICE_F_NONBLOCK;
     int *fds = (int *)tls_pipe.get_resource();
     assert(fds);
@@ -2001,27 +2042,45 @@ void NVMJournal::_flush_bh(ObjectRef obj, BufferHead *pbh)
     if (pos == BufferHead::TRUNC) {
 	/* do nothing */
     }
-    else (pos == BufferHead::ZERO) {
+    else if (pos == BufferHead::ZERO) {
 
     }
     else {
 	bool need_to_flush = false;
-	 pos = pos << CEPH_PAGE_SHIFT;
-	 if (write_pos >= pos && pos >= data_sync_pos)
+	pos = pos << CEPH_PAGE_SHIFT;
+	if (write_pos >= pos && pos >= data_sync_pos)
 	    need_to_flush = true;
 	else if (!(write_pos < pos && pos < data_sync_pos))
 	    need_to_flush = true;
 	if (need_to_flush) {
 	    loff_t ssd_off = SSD_OFF(pbh);
-	    loff_t obj_off = bh2->ext.start;
-            uint32_t len = bh2->ext.end - bh2->ext.start;
-	    // don't need to worry about the page align problem
-	    // // even though ssd_fd was opened with O_DIRECT
+	    loff_t obj_off = pbh->ext.start;
+            uint32_t len = pbh->ext.end - pbh->ext.start;
+
+	    /**
+             * don't need to worry about the sector align problem
+             * even though ssd_fd was opened with O_DIRECT
+             **/
 	    ssize_t r = safe_splice(fd, &ssd_off, fds[1], NULL, len, flags);
             assert(r == len);
-	    // out_fd = store->open(obj->coll, obj->oid);
-	    // r = safe_splice(fds[0], NULL, out_fd, obj_off, flags);
-	    valid = true;
+
+	    /**
+             * when using disk as backend storage:
+             *    out_fd = store->open(obj->coll, obj->oid);
+	     *    r = safe_splice(fds[0], NULL, out_fd, obj_off, len, flags);
+             *    ...
+             **/
+             {
+                // just for debug ...
+                bufferptr bp(len);
+                r = safe_read(fds[0], bp.c_str(), len);
+                assert (r == len);
+                bufferlist bl;
+                bl.append(bp);
+                const coll_t &cid = obj->alias.begin()->first;
+                const ghobject_t &oid = obj->alias.begin()->second;
+                store->_write(cid, oid, obj_off, len, bl, 0);
+             }
 	}
     }
 }
@@ -2040,7 +2099,7 @@ void NVMJournal::do_ev(EvOp *ev, ThreadPool::TPHandle *handle)
         // check the object 
 
         bool valid = false; 
-        map<uint32_t, BufferHead *>::iterator t = obj->data.lower_bound(start);
+        map<uint32_t, BufferHead *>::iterator t = obj->data.lower_bound(bh->ext.start);
         if (t != obj->data.begin())
             -- t;
 
@@ -2149,7 +2208,7 @@ void NVMJournal::do_reclaim()
 	start_pos = pre << CEPH_PAGE_SHIFT;
     
     {
-	Mutex::Locker l(sync_mutex);
+	Mutex::Locker l(sync_lock);
 	if (start_pos >= data_sync_pos_recorded) {
 	    _sync();
 	}

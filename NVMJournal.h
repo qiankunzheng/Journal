@@ -13,14 +13,46 @@
 
 using std::deque;
 
-class MemStore;
+class BackStore {
+public:
+	BackStore();
+	virtual ~BackStore();
+public:
+	virtual void sync() { };
+	virtual int _setattrs(coll_t c, const ghobject_t &oid, map<string, bufferptr> &aset) = 0;
+	virtual int _rmattr(coll_t c, const ghobject_t &o, string name);
+	virtual int _rmattrs(coll_t c, const ghobject_t &o) = 0;
+	virtual int _collection_hint_expected_num_objs(coll_t cid, uint32_t pg_num, uint64_t num_objs) const { return 0; }
+	virtual int _collection_setattr(coll_t c, const char *name, const void *value, size_t size) = 0;
+	virtual int _collection_rmattr(coll_t c, const char *name) = 0;
+	virtual int _omap_clear(coll_t c, const ghobject_t &o) = 0;
+	virtual int _omap_setkeys(coll_t c, const ghobject_t& o, const map<string, bufferlist> &aset) = 0;
+	virtual int _omap_rmkeys(coll_t c, const ghobject_t& o, const set<string> &keys) = 0;
+	virtual int _omap_rmkeyrange(coll_t c, const ghobject_t& o, const string& first, const string& last) = 0;
+	virtual int _omap_setheader(coll_t c, const ghobject_t& o, const bufferlist &bl) = 0;
+	virtual bool collection_exists(coll_t c) = 0;
+	virtual bool exists(coll_t c, const ghobject_t &o) = 0;
+	virtual int _touch(coll_t c, const ghobject_t& o) = 0;
+	virtual int _truncate(coll_t c, const ghobject_t& o, uint64_t size) = 0;
+	virtual int _remove(coll_t c, const ghobject_t &o) = 0;
+	virtual int _clone(coll_t c, const ghobject_t& oo, const ghobject_t& no) = 0;	
+	virtual int _clone_range(coll_t c, const ghobject_t& oo, const ghobject_t& no, uint64_t srcoff, uint64_t len, uint64_t dstoff) = 0;
+	virtual int _create_collection(coll_t c) = 0;
+	virtual int _destroy_collection(coll_t c) = 0;
+	virtual int _collection_add(coll_t dst, coll_t src, const ghobject_t &o) = 0;
+	virtual int _collection_move_rename(coll_t oc, const ghobject_t& oo, coll_t nc, const ghobject_t& no) = 0;
+	virtual int _collection_rename(const coll_t &c, const coll_t &nc) = 0;
+	virtual int _split_collection(coll_t c, uint32_t bits, uint32_t rem, coll_t dest) = 0;
+        virtual int _read(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, bufferptr& bp) = 0;
+        virtual int _write(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, const bufferlist& bl, bool replica = false) = 0;
+} ;
 
 class RWJournal {
     protected:
-	MemStore *store;
+	BackStore *store;
 	Finisher *finisher;
     public:
-	RWJournal(MemStore *s, Finisher *fin) : 
+	RWJournal(BackStore *s, Finisher *fin) : 
 		store(s),
 		finisher(fin) {	}
 	virtual ~RWJournal() { }
@@ -32,10 +64,9 @@ class RWJournal {
 	typedef ObjectStore::Sequencer Sequencer;
 	typedef ObjectStore::Sequencer_impl Sequencer_impl;
 
-	virtual void submit_entry(Sequencer *posr, list<Transaction*> &tls)= 0;
+	virtual void submit_entry(Sequencer *posr, list<Transaction*> &tls, ThreadPool::TPHandle *handle) = 0;
 
-	virtual void read_object(coll_t &cid, ghobject_t &oid, uint64_t off, size_t len,
-			bufferlist &bl) = 0;
+	virtual int read_object(coll_t cid, const ghobject_t &oid, uint64_t off, size_t len, bufferlist &bl) = 0;
 
 	void set_evict_threshold(double ev) {
 		evict_threshold = ev;
@@ -49,8 +80,8 @@ class RWJournal {
 
 class ThreadLocalStore {
 	pthread_key_t thread_pipe_key;
-	virtual static void release_resource(void *rc);
-	virtual static void *init_resource();
+	static void release_resource(void *rc) { }
+	static void *init_resource() { return NULL; }
 public:
 	ThreadLocalStore() {
 		pthread_key_create(&thread_pipe_key, release_resource);
@@ -135,8 +166,8 @@ class NVMJournal : public RWJournal {
 	    	:open_ops(0), 
 	    	lock("NVMJournal::ApplyManager::lock", false, true, false, g_ceph_context)
 	    	{ }
-	    void set_block();
-	    void reset_block();
+	    void sync_start();
+	    void sync_finish();
 	    void op_apply_start(uint32_t ops = 1);
 	    void op_apply_finish(uint32_t ops = 1);
 	};
@@ -164,8 +195,8 @@ class NVMJournal : public RWJournal {
 	Mutex writeq_lock;
 	Cond writeq_cond;
 
-	Cond op_throttle_cond;
 	Mutex op_throttle_lock;
+	Cond op_throttle_cond;
 	uint64_t op_queue_len;
 	static const uint64_t op_queue_max = 64; 
 	void op_queue_reserve_throttle(ThreadPool::TPHandle *handle);
@@ -179,7 +210,7 @@ class NVMJournal : public RWJournal {
 	    struct iocb iocb;
 	    uint64_t seq;
 	    bufferlist bl; // KEEP REFERENCE TO THE IOV BUFFER
-	    int len;
+	    uint32_t len;
 	    struct iovec *iov;
 	    bool done;
 
@@ -316,16 +347,16 @@ class NVMJournal : public RWJournal {
 		while (!flush_waiters.empty()) {
 		    if (flush_waiters.front().first >= seq)
 			break;
-		    to_queue.push_back(flush_waiter.front().second);
+		    to_queue.push_back(flush_waiters.front().second);
 		    flush_waiters.pop_front();
 		}
 		cond.Signal();
 	    }
-	    task &peek_queue() {
+	    Op* peek_queue() {
 		assert(apply_lock.is_locked());
 		return tq.front();
 	    }
-            void queue(const Op *op) {
+            void queue(Op *op) {
                 Mutex::Locker l(lock);  
                 tq.push_back(op);
             }
@@ -338,7 +369,7 @@ class NVMJournal : public RWJournal {
 		if (op_q.empty())
 		    return;
 		uint64_t seq = op_q.back();
-		while (!op_q.empty() && op_q.font() <= seq)
+		while (!op_q.empty() && op_q.front() <= seq)
 		    cond.Wait(lock);
 	    }
 	    bool flush_commit(Context *c) {
@@ -398,22 +429,24 @@ class NVMJournal : public RWJournal {
 	}
 	void _do_op(OpSequencer *posr, ThreadPool::TPHandle *handle);
 
-	void do_op(Op *op, ThreadPool::TPHandle *handle);
+	bool need_to_update_store(uint64_t pos);
+	void do_op(Op *op, ThreadPool::TPHandle *handle = NULL);
 	void do_transaction(Transaction *t, uint64_t seq, uint64_t entry_pos, uint32_t &off);
 	int _touch(coll_t cid, const ghobject_t &oid);
 	int _write(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff);
 	int _zero(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len);
 	int _truncate(coll_t cid, const ghobject_t &oid, uint32_t off, bool update_store);
-	int _remove(coll_t cid, const ghobect_t &oid, bool update_store);
+	int _remove(coll_t cid, const ghobject_t &oid, bool update_store);
 	int _clone(coll_t cid, const ghobject_t &src, const ghobject_t &dst, bool update_store);
 	int _clone_range(coll_t cid, ghobject_t &src, ghobject_t &dst,
 		uint64_t off, uint64_t len, uint64_t dst_off, bool update_store);
-	int _create_collection(cid, bool update_store);
-	int _destroy_collection(cid, bool update_store);
-	int _collection_add(coll_t dst, coll_t src, ghobject_t &oid, bool update_store);
-	int _collection_move_rename(coll_t oldcid, ghobject_t &oldoid, coll_t newcid, ghobject_t &newoid, bool update_store);
+	int _create_collection(coll_t cid, bool update_store);
+	int _destroy_collection(coll_t cid, bool update_store);
+	int _collection_add(coll_t dst, coll_t src, const ghobject_t &oid, bool update_store);
+	int _collection_move_rename(coll_t oldcid, const ghobject_t &oldoid, coll_t newcid, const ghobject_t &newoid, bool update_store);
 	int _collection_rename(coll_t cid, coll_t ncid, bool update_store);
-	int _spilt_collection(coll_t src, uin32_t bits, uint32_t match, coll_t dst, bool update_store);
+	int _split_collection(coll_t src, uint32_t bits, uint32_t match, coll_t dst, bool update_store);
+	int do_other_op(int op, Transaction::iterator& p);
 
 	/* memory data structure */
 
@@ -434,7 +467,7 @@ class NVMJournal : public RWJournal {
 	void _flush_bh(ObjectRef obj, BufferHead *pbh);
 	class ThreadLocalPipe: public ThreadLocalStore 
 	{
-		virtual static void *init_resource() {
+		static void *init_resource() {
 			int *fds = new int[2];
 			assert(fds);
         		assert(::pipe(fds) == 0);
@@ -444,7 +477,7 @@ class NVMJournal : public RWJournal {
         		::fcntl(fds[1], F_SETFL, O_NONBLOCK);
         		return (void *)fds;
 		}
-		virtual static void release_resource(void *rc) {
+		static void release_resource(void *rc) {
 			if (!rc)
 				return;
 			int *fds = (int *)rc;
@@ -479,7 +512,7 @@ class NVMJournal : public RWJournal {
 	    NVMJournal *Journal;
 	public:
 	    EvWQ(time_t timeout, time_t suicide_timeout, ThreadPool *tp, NVMJournal *J) 
-		: ThreadPool::WorkQueue<OpSequencer>("NVMJournal::EvWQ", timeout, suicide_timeout, tp), Journal(J) { }
+		: ThreadPool::WorkQueue<EvOp>("NVMJournal::EvWQ", timeout, suicide_timeout, tp), Journal(J) { }
 	    bool _enqueue(EvOp *op) {
 		Journal->ev_queue.push_back(op);
 		return true;
@@ -498,7 +531,7 @@ class NVMJournal : public RWJournal {
 		return op;
 	    }
 	    void _process(EvOp *op, ThreadPool::TPHandle *handle) {
-		Journal->_do_ev(op, handle);
+		Journal->do_ev(op, handle);
 	    }
 	    void _process_finish(EvOp *op) {
 	    }
@@ -509,6 +542,7 @@ class NVMJournal : public RWJournal {
 	void queue_ev(EvOp *op) {
 		ev_wq.queue(op);
 	}
+	void do_ev(EvOp *ev, ThreadPool::TPHandle *handle);
 
 	Mutex evict_lock;
 	Cond evict_cond;
@@ -518,7 +552,7 @@ class NVMJournal : public RWJournal {
 	bool should_evict();
 	void wait_for_more_space(uint64_t min);
 	void evict_entry();
-	void update_synced_position(uint32_t synced);
+	void check_ev_completion();
 
 	
 	class JournalEvictor : public Thread {
@@ -532,7 +566,7 @@ class NVMJournal : public RWJournal {
 	} evictor;
 
 	bool ev_stop;
-	uint32_t ev_pause 
+	uint32_t ev_pause;
 	bool ev_paused;
 	void stop_evictor();
 	void pause_ev_work();
@@ -548,7 +582,7 @@ class NVMJournal : public RWJournal {
 	{
 	    set< pair<coll_t, ghobject_t> > alias;
 	    atomic_t ref;
-	    
+	    uint32_t size;
 	    ObjectRef parent;
 	    map<uint32_t, BufferHead*> data;
 	    RWLock lock;
@@ -565,6 +599,7 @@ class NVMJournal : public RWJournal {
 	};
 
 	struct Collection {
+		coll_t cid;
 		ceph::unordered_map<ghobject_t, ObjectRef> Object_hash;
 		map<ghobject_t, ObjectRef> Object_map;
 		OpSequencer *osr;
@@ -574,33 +609,26 @@ class NVMJournal : public RWJournal {
 		 * from backend ev/reclaim work and normal operation
 		 */
 
-		Collection(OpSequencer *o) 
-		    : osr(o), 
-		    lock("NVMJournal::Collection::lock",false, true, false, g_ceph_context) { }
+		Collection(coll_t c) 
+		    : cid(c), lock("NVMJournal::Collection::lock",false, true, false, g_ceph_context) { }
 	};
 
 	typedef ceph::shared_ptr<Collection> CollectionRef;
 	
 	struct CollectionMap {
-	    ceph::unordered_mapmap<coll_t, CollectionRef> collections;
+	    ceph::unordered_map<coll_t, CollectionRef> collections;
 	    Mutex lock;
 	    CollectionMap() :
 		    lock("NVMJournal::CacheShard::lock",false, true, false, g_ceph_context) {}
 	} coll_map;
 
 
-	CollectionRef get_collection(coll_t &cid, bool create = false) ;
+	CollectionRef get_collection(coll_t cid, bool create = false) ;
 
-	ObjectRef get_object(coll_t &cid, const ghobject_t &oid, bool create = false) ;
+	ObjectRef get_object(coll_t cid, const ghobject_t &oid, bool create = false) ;
 	ObjectRef get_object(CollectionRef coll, const ghobject_t &oid, bool create = false);
 
-	inline void erase_object_with_lock_hold(CollectionRef coll, ghobject_t &obj) ;
-	void erase_object_without_lock(CollectionRef coll, ghobject_t &obj) {
-	    if (!coll)
-		return;
-	    Mutex::Locker l(coll->lock);
-	    erase_object_with_lock_hold(coll, obj);
-	}
+	inline void erase_object_with_lock_hold(CollectionRef coll, const ghobject_t &obj) ;
 
 	void put_object(ObjectRef obj, bool locked = false) ;
 
@@ -616,15 +644,12 @@ class NVMJournal : public RWJournal {
 	}
 	void get_write_lock(ObjectRef obj) {
 	    assert(obj);
-	    obj->lock.get_wrtie();
+	    obj->lock.get_write();
 	}
 	void put_write_lock(ObjectRef obj) {
 	    assert(obj);
 	    obj->lock.put_write();
 	}
-
-	inline void NVMJournal::get_objects_lock(ObjectRef a, ObjectRef b);
-	inline void NVMJournal::put_objects_lock(ObjectRef a, ObjectRef b);
 
 	void merge_new_bh(ObjectRef obj, BufferHead *bh);
 	void delete_bh(ObjectRef obj, uint32_t off, uint32_t end, uint32_t bentry);
@@ -633,6 +658,8 @@ class NVMJournal : public RWJournal {
 
 	struct ReadOp 
 	{
+	    coll_t cid;
+	    ghobject_t oid;
 	    ObjectRef obj;
 	    uint32_t off;
 	    uint32_t length;
@@ -650,13 +677,13 @@ class NVMJournal : public RWJournal {
                         map<uint32_t, uint64_t> &trans,
                         map<uint32_t, uint32_t> &missing);
 	void build_read(coll_t &cid, const ghobject_t &oid, uint64_t off, size_t len, ReadOp &op);
-	void build_read_from_parent(ObjectRef parent, ReadOp& op);
-	void do_read(ReadOp &op);
+	void build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp& op);
+	int do_read(ReadOp &op);
 
     public:
-	void read_object(coll_t &cid, ghobject_t &oid, uint64_t off, size_t& len, bufferlist &buf);
+	int read_object(coll_t cid, const ghobject_t &oid, uint64_t off, size_t len, bufferlist &bl);
 
-	NVMJournal(string dev, string conf, MemStore *s, Finisher *fin);
+	NVMJournal(string dev, string conf, BackStore *s, Finisher *fin);
 
 	virtual ~NVMJournal();
 

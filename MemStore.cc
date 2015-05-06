@@ -294,8 +294,16 @@ int MemStore::read(
     bufferlist& bl,
     bool allow_eio)
 {
-  dout(10) << __func__ << " " << cid << " " << oid << " "
-	   << offset << "~" << len << dendl;
+  journal.read_object(cid, oid, offset, len, bl);
+  return bl.length();
+}
+
+int MemStore::_read(coll_t cid,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    bufferptr& bp) 
+{
   CollectionRef c = get_collection(cid);
   if (!c)
     return -ENOENT;
@@ -311,8 +319,12 @@ int MemStore::read(
     l = o->data.length();
   else if (offset + l > o->data.length())
     l = o->data.length() - offset;
+  bufferlist bl;
   bl.clear();
   bl.substr_of(o->data, offset, l);
+  bufferlist dst;
+  dst.append(bp);
+  dst.copy_in(0, bl.length(), bl);
   return bl.length();
 }
 
@@ -654,7 +666,7 @@ int MemStore::queue_transactions(Sequencer *osr,
 
   // + by tanghao
   {
-    journal.submit_entry(osr, tls);
+    journal.submit_entry(osr, tls, handle);
     return 0;
   }
 
