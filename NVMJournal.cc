@@ -1079,7 +1079,7 @@ int NVMJournal::do_other_op(int op, Transaction::iterator& i)
 		coll_t cid = i.decode_cid();
 		ghobject_t oid = i.decode_oid();
 		string name = i.decode_attrname();
-		r = store->_rmattr(cid, oid, name);
+		r = store->_rmattr(cid, oid, name.c_str());
 	    }
 	    break;
 	case Transaction::OP_RMATTRS:

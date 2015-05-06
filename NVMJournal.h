@@ -15,36 +15,59 @@ using std::deque;
 
 class BackStore {
 public:
-	BackStore();
-	virtual ~BackStore();
+	BackStore() { };
+	virtual ~BackStore() { };
 public:
 	virtual void sync() { };
-	virtual int _setattrs(coll_t c, const ghobject_t &oid, map<string, bufferptr> &aset) = 0;
-	virtual int _rmattr(coll_t c, const ghobject_t &o, string name);
-	virtual int _rmattrs(coll_t c, const ghobject_t &o) = 0;
-	virtual int _collection_hint_expected_num_objs(coll_t cid, uint32_t pg_num, uint64_t num_objs) const { return 0; }
-	virtual int _collection_setattr(coll_t c, const char *name, const void *value, size_t size) = 0;
-	virtual int _collection_rmattr(coll_t c, const char *name) = 0;
-	virtual int _omap_clear(coll_t c, const ghobject_t &o) = 0;
-	virtual int _omap_setkeys(coll_t c, const ghobject_t& o, const map<string, bufferlist> &aset) = 0;
-	virtual int _omap_rmkeys(coll_t c, const ghobject_t& o, const set<string> &keys) = 0;
-	virtual int _omap_rmkeyrange(coll_t c, const ghobject_t& o, const string& first, const string& last) = 0;
-	virtual int _omap_setheader(coll_t c, const ghobject_t& o, const bufferlist &bl) = 0;
+	virtual int _setattrs(coll_t c, const ghobject_t &oid, map<string, bufferptr> &aset) 
+		{ assert(0); return 0;}
+	virtual int _rmattr(coll_t c, const ghobject_t &o, const char *name) = 0;
+	virtual int _rmattrs(coll_t c, const ghobject_t &o)
+		{ assert(0); return 0;}
+	virtual int _collection_hint_expected_num_objs(coll_t cid, uint32_t pg_num, uint64_t num_objs) const 
+		{ return 0; }
+	virtual int _collection_setattr(coll_t c, const char *name, const void *value, size_t size)
+		{ assert(0); return 0;}
+	virtual int _collection_rmattr(coll_t c, const char *name)
+		{ assert(0); return 0;}
+	virtual int _omap_clear(coll_t c, const ghobject_t &o)
+		{ assert(0); return 0;}
+	virtual int _omap_setkeys(coll_t c, const ghobject_t& o, const map<string, bufferlist> &aset)
+		{ assert(0); return 0;}
+	virtual int _omap_rmkeys(coll_t c, const ghobject_t& o, const set<string> &keys)
+		{ assert(0); return 0;}
+	virtual int _omap_rmkeyrange(coll_t c, const ghobject_t& o, const string& first, const string& last)
+		{ assert(0); return 0;}
+	virtual int _omap_setheader(coll_t c, const ghobject_t& o, const bufferlist &bl)
+		{ assert(0); return 0;}
 	virtual bool collection_exists(coll_t c) = 0;
 	virtual bool exists(coll_t c, const ghobject_t &o) = 0;
-	virtual int _touch(coll_t c, const ghobject_t& o) = 0;
-	virtual int _truncate(coll_t c, const ghobject_t& o, uint64_t size) = 0;
-	virtual int _remove(coll_t c, const ghobject_t &o) = 0;
-	virtual int _clone(coll_t c, const ghobject_t& oo, const ghobject_t& no) = 0;	
-	virtual int _clone_range(coll_t c, const ghobject_t& oo, const ghobject_t& no, uint64_t srcoff, uint64_t len, uint64_t dstoff) = 0;
-	virtual int _create_collection(coll_t c) = 0;
-	virtual int _destroy_collection(coll_t c) = 0;
-	virtual int _collection_add(coll_t dst, coll_t src, const ghobject_t &o) = 0;
-	virtual int _collection_move_rename(coll_t oc, const ghobject_t& oo, coll_t nc, const ghobject_t& no) = 0;
-	virtual int _collection_rename(const coll_t &c, const coll_t &nc) = 0;
-	virtual int _split_collection(coll_t c, uint32_t bits, uint32_t rem, coll_t dest) = 0;
-        virtual int _read(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, bufferptr& bp) = 0;
-        virtual int _write(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, const bufferlist& bl, bool replica = false) = 0;
+	virtual int _touch(coll_t c, const ghobject_t& o)
+		{ assert(0); return 0;}
+	virtual int _truncate(coll_t c, const ghobject_t& o, uint64_t size)
+		{ assert(0); return 0;}
+	virtual int _remove(coll_t c, const ghobject_t &o)
+		{ assert(0); return 0;}
+	virtual int _clone(coll_t c, const ghobject_t& oo, const ghobject_t& no)
+		{ assert(0); return 0;}	
+	virtual int _clone_range(coll_t c, const ghobject_t& oo, const ghobject_t& no, uint64_t srcoff, uint64_t len, uint64_t dstoff)
+		{ assert(0); return 0;}
+	virtual int _create_collection(coll_t c)
+		{ assert(0); return 0;}
+	virtual int _destroy_collection(coll_t c)
+		{ assert(0); return 0;}
+	virtual int _collection_add(coll_t dst, coll_t src, const ghobject_t &o)
+		{ assert(0); return 0;}
+	virtual int _collection_move_rename(coll_t oc, const ghobject_t& oo, coll_t nc, const ghobject_t& no)
+		{ assert(0); return 0;}
+	virtual int _collection_rename(const coll_t &c, const coll_t &nc)
+		{ assert(0); return 0;}
+	virtual int _split_collection(coll_t c, uint32_t bits, uint32_t rem, coll_t dest)
+		{ assert(0); return 0;}
+        virtual int _read(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, bufferptr& bp)
+        	{ assert(0); return 0;}
+        virtual int _write(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, const bufferlist& bl, bool replica = false)
+        	{ assert(0); return 0;}
 } ;
 
 class RWJournal {
