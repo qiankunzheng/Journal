@@ -64,7 +64,7 @@ public:
 		{ assert(0); return 0;}
 	virtual int _split_collection(coll_t c, uint32_t bits, uint32_t rem, coll_t dest)
 		{ assert(0); return 0;}
-        virtual int _read(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, bufferptr& bp)
+        virtual int _read(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, bufferlist& bl)
         	{ assert(0); return 0;}
         virtual int _write(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, const bufferlist& bl, bool replica = false)
         	{ assert(0); return 0;}
@@ -77,10 +77,12 @@ class RWJournal {
     public:
 	RWJournal(BackStore *s, Finisher *fin) : 
 		store(s),
-		finisher(fin) {	}
+		finisher(fin),
+		evict_threshold(0.7) {	}
 	virtual ~RWJournal() { }
 
 	virtual int create() = 0;
+	virtual void stop() = 0;
 	virtual int mkjournal() = 0;
 
 	typedef ObjectStore::Transaction Transaction;
@@ -99,24 +101,6 @@ class RWJournal {
 	double evict_threshold;
 	// double cur_fraction;
 
-};
-
-class ThreadLocalStore {
-	pthread_key_t thread_pipe_key;
-	static void release_resource(void *rc) { }
-	static void *init_resource() { return NULL; }
-public:
-	ThreadLocalStore() {
-		pthread_key_create(&thread_pipe_key, release_resource);
-	}
-	void *get_resource() {
-		void *rc = pthread_getspecific(thread_pipe_key);
-		if (!rc) {
-			rc = init_resource();
-			pthread_setspecific (thread_pipe_key, rc);
-		}
-		return rc;
-	}
 };
 
 class NVMJournal : public RWJournal {
@@ -201,6 +185,7 @@ class NVMJournal : public RWJournal {
 	
     public:
 	int create();
+	void stop();
 	int mkjournal();
 
     private:
@@ -414,6 +399,7 @@ class NVMJournal : public RWJournal {
 	deque<OpSequencer*> os_queue;
 
 	ThreadPool op_tp;
+	bool op_tp_started;
 	struct OpWQ: public ThreadPool::WorkQueue<OpSequencer> {
 	    NVMJournal *Journal;
 	public:
@@ -436,8 +422,8 @@ class NVMJournal : public RWJournal {
 		Journal->os_queue.pop_front();
 		return osr;
 	    }
-	    void _process(OpSequencer *osr, ThreadPool::TPHandle *handle) {
-		Journal->_do_op(osr, handle);
+	    void _process(OpSequencer *osr, ThreadPool::TPHandle &handle) {
+		Journal->_do_op(osr, &handle);
 	    }
 	    void _process_finish(OpSequencer *osr) {
 	    }
@@ -488,25 +474,38 @@ class NVMJournal : public RWJournal {
 	};
 
 	void _flush_bh(ObjectRef obj, BufferHead *pbh);
-	class ThreadLocalPipe: public ThreadLocalStore 
-	{
-		static void *init_resource() {
-			int *fds = new int[2];
-			assert(fds);
-        		assert(::pipe(fds) == 0);
+	class ThreadLocalPipe {
+	    pthread_key_t thread_pipe_key;
+	    void *init_resource() {
+		int *fds = new int[2];
+		assert(fds);
+		assert(::pipe(fds) == 0);
+		::fcntl(fds[1], F_SETPIPE_SZ, 4*1024*1024);
+		::fcntl(fds[0], F_SETFL, O_NONBLOCK);
+		::fcntl(fds[1], F_SETFL, O_NONBLOCK);
+		return (void *)fds;
+	    }
+	    static void release_resource(void *rc) {
+	    	if (!rc)
+    			return;
+		int *fds = (int *)rc;
+	    	close (fds[0]);
+    		close (fds[1]);
+	    }
+	public:
+	    ThreadLocalPipe() {
+		pthread_key_create(&thread_pipe_key, release_resource);
+	    }
+	    void *get_resource() {
+		void *rc = pthread_getspecific(thread_pipe_key);
+		if (!rc) {
+		    while (!rc)
+			rc = init_resource();
+		    pthread_setspecific (thread_pipe_key, rc);
+		}
+		return rc;
+	    }
 
-        		::fcntl(fds[1], F_SETPIPE_SZ, 4*1024*1024);
-        		::fcntl(fds[0], F_SETFL, O_NONBLOCK);
-        		::fcntl(fds[1], F_SETFL, O_NONBLOCK);
-        		return (void *)fds;
-		}
-		static void release_resource(void *rc) {
-			if (!rc)
-				return;
-			int *fds = (int *)rc;
-			close (fds[0]);
-			close (fds[1]);
-		}
 	} tls_pipe;
 
 	deque<BufferHead*> Journal_queue;
@@ -531,6 +530,7 @@ class NVMJournal : public RWJournal {
 	deque<EvOp *> ev_queue;
 
 	ThreadPool ev_tp;
+	bool ev_tp_started;
 	class EvWQ: public ThreadPool::WorkQueue<EvOp> {
 	    NVMJournal *Journal;
 	public:
@@ -553,8 +553,8 @@ class NVMJournal : public RWJournal {
 		Journal->ev_queue.pop_front();
 		return op;
 	    }
-	    void _process(EvOp *op, ThreadPool::TPHandle *handle) {
-		Journal->do_ev(op, handle);
+	    void _process(EvOp *op, ThreadPool::TPHandle &handle) {
+		Journal->do_ev(op, &handle);
 	    }
 	    void _process_finish(EvOp *op) {
 	    }
@@ -592,6 +592,7 @@ class NVMJournal : public RWJournal {
 	uint32_t ev_pause;
 	bool ev_paused;
 	void stop_evictor();
+	Cond evict_pause_cond;
 	void pause_ev_work();
 	void unpause_ev_work();
 
@@ -612,6 +613,7 @@ class NVMJournal : public RWJournal {
 	    
 	    Object(coll_t c, ghobject_t o) :
 		ref(0), 
+		size(0),
 		parent(NULL),
 		lock("NVMJournal::lock") {
 		    alias.insert( make_pair(c, o) );
@@ -695,10 +697,12 @@ class NVMJournal : public RWJournal {
 
 	    map<uint32_t, uint32_t> missing; // 
 	};
+	void dump(const ReadOp &op);
 	void map_read(ObjectRef obj, uint32_t off, uint32_t end,
                         map<uint32_t, uint32_t> &hits,
                         map<uint32_t, uint64_t> &trans,
-                        map<uint32_t, uint32_t> &missing);
+                        map<uint32_t, uint32_t> &missing,
+			bool trunc_as_zero = false);
 	void build_read(coll_t &cid, const ghobject_t &oid, uint64_t off, size_t len, ReadOp &op);
 	void build_read_from_parent(ObjectRef parent, ObjectRef obj, ReadOp& op);
 	int do_read(ReadOp &op);

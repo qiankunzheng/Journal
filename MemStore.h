@@ -240,7 +240,7 @@ public:
       coll_lock("MemStore::coll_lock"),
       apply_lock("MemStore::apply_lock"),
       finisher(cct),
-      journal("/dev/ram0", path, this, &finisher) { } // + by tanghao
+      journal("/dev/sdc", path, this, &finisher) { } // + by tanghao
   ~MemStore() { }
 
   int update_version_stamp() {
@@ -292,7 +292,7 @@ public:
     size_t len,
     bufferlist& bl,
     bool allow_eio = false);
-  int _read(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferptr& bp);
+  int _read(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferlist& bl);
   int fiemap(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferlist& bl);
   int getattr(coll_t cid, const ghobject_t& oid, const char *name, bufferptr& value);
   int getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset);

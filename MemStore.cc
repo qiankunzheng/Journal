@@ -59,6 +59,7 @@ int MemStore::mount()
 
 int MemStore::umount()
 {
+  journal.stop();
   finisher.stop();
   return _save();
 }
@@ -67,7 +68,7 @@ int MemStore::_save()
 {
   dout(10) << __func__ << dendl;
   Mutex::Locker l(apply_lock); // block any writer
-  dump_all();
+  // dump_all();
   set<coll_t> collections;
   for (ceph::unordered_map<coll_t,CollectionRef>::iterator p = coll_map.begin();
        p != coll_map.end();
@@ -170,7 +171,7 @@ int MemStore::_load()
     coll_map[*q] = c;
   }
 
-  dump_all();
+ // dump_all();
 
   return 0;  
 }
@@ -294,15 +295,19 @@ int MemStore::read(
     bufferlist& bl,
     bool allow_eio)
 {
-  journal.read_object(cid, oid, offset, len, bl);
-  return bl.length();
+    size_t l = len;
+    if (l == 0) l = 128<<20; 
+    int r = journal.read_object(cid, oid, offset, l, bl);
+    if (r < 0)
+	return r;
+    return bl.length();
 }
 
 int MemStore::_read(coll_t cid,
     const ghobject_t& oid,
     uint64_t offset,
     size_t len,
-    bufferptr& bp) 
+    bufferlist& bl) 
 {
   CollectionRef c = get_collection(cid);
   if (!c)
@@ -319,12 +324,8 @@ int MemStore::_read(coll_t cid,
     l = o->data.length();
   else if (offset + l > o->data.length())
     l = o->data.length() - offset;
-  bufferlist bl;
   bl.clear();
   bl.substr_of(o->data, offset, l);
-  bufferlist dst;
-  dst.append(bp);
-  dst.copy_in(0, bl.length(), bl);
   return bl.length();
 }
 
@@ -1021,7 +1022,7 @@ void MemStore::_do_transaction(Transaction& t)
 
 	if (r == -ENOTEMPTY) {
 	  msg = "ENOTEMPTY suggests garbage data in osd data dir";
-	  dump_all();
+	 // dump_all();
 	}
 
 	dout(0) << " error " << cpp_strerror(r) << " not handled on operation " << op
