@@ -12,7 +12,8 @@ ceph osd中的objectstore封装了所有底层的IO操作，向上层模块提�
 # 使用
 采用版本为0.87的ceph源码，将src/os/下的代码拷贝到ceph的相应目录中，然后按照现有的原有的方式编译安装
 修改ceph集群配置文件ceph.conf中的osd journal：
-  osd journal = nvmstore
+  osd objectstore = nvmstore
+  osd journal = path_of_the_journal
 表示使用nvmstore存储引擎
 
 # src/mytest/
