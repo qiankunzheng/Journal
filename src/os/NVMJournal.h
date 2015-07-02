@@ -9,65 +9,56 @@
 #include "ObjectStore.h"
 
 #include <deque>
+#include <map>
+#include <list>
 #include <libaio.h>
 
 using std::deque;
+using std::map;
+using std::list;
 
 class BackStore {
 public:
 	BackStore() { };
 	virtual ~BackStore() { };
 public:
-	virtual void sync() { };
-	virtual int _setattrs(coll_t c, const ghobject_t &oid, map<string, bufferptr> &aset) 
-		{ assert(0); return 0;}
-	virtual int _rmattr(coll_t c, const ghobject_t &o, const char *name) = 0;
-	virtual int _rmattrs(coll_t c, const ghobject_t &o)
-		{ assert(0); return 0;}
-	virtual int _collection_hint_expected_num_objs(coll_t cid, uint32_t pg_num, uint64_t num_objs) const 
+	virtual void create_async_snapshot() { };
+	virtual void flush_snapshot() { };
+	virtual int _setattrs(coll_t c, const ghobject_t &oid, map<string, bufferptr> &aset) { return -1; }
+	virtual int _rmattr(coll_t c, const ghobject_t &o, const char *name) { return -1; }
+	virtual int _rmattrs(coll_t c, const ghobject_t &o) { return -1; }
+	virtual int _collection_hint_expected_num_objs(coll_t cid, uint32_t pg_num, uint64_t num_objs) const
 		{ return 0; }
-	virtual int _collection_setattr(coll_t c, const char *name, const void *value, size_t size)
-		{ assert(0); return 0;}
-	virtual int _collection_rmattr(coll_t c, const char *name)
-		{ assert(0); return 0;}
-	virtual int _omap_clear(coll_t c, const ghobject_t &o)
-		{ assert(0); return 0;}
-	virtual int _omap_setkeys(coll_t c, const ghobject_t& o, const map<string, bufferlist> &aset)
-		{ assert(0); return 0;}
-	virtual int _omap_rmkeys(coll_t c, const ghobject_t& o, const set<string> &keys)
-		{ assert(0); return 0;}
-	virtual int _omap_rmkeyrange(coll_t c, const ghobject_t& o, const string& first, const string& last)
-		{ assert(0); return 0;}
-	virtual int _omap_setheader(coll_t c, const ghobject_t& o, const bufferlist &bl)
-		{ assert(0); return 0;}
-	virtual bool collection_exists(coll_t c) = 0;
-	virtual bool exists(coll_t c, const ghobject_t &o) = 0;
-	virtual int _touch(coll_t c, const ghobject_t& o)
-		{ assert(0); return 0;}
-	virtual int _truncate(coll_t c, const ghobject_t& o, uint64_t size)
-		{ assert(0); return 0;}
-	virtual int _remove(coll_t c, const ghobject_t &o)
-		{ assert(0); return 0;}
-	virtual int _clone(coll_t c, const ghobject_t& oo, const ghobject_t& no)
-		{ assert(0); return 0;}	
-	virtual int _clone_range(coll_t c, const ghobject_t& oo, const ghobject_t& no, uint64_t srcoff, uint64_t len, uint64_t dstoff)
-		{ assert(0); return 0;}
-	virtual int _create_collection(coll_t c)
-		{ assert(0); return 0;}
-	virtual int _destroy_collection(coll_t c)
-		{ assert(0); return 0;}
-	virtual int _collection_add(coll_t dst, coll_t src, const ghobject_t &o)
-		{ assert(0); return 0;}
-	virtual int _collection_move_rename(coll_t oc, const ghobject_t& oo, coll_t nc, const ghobject_t& no)
-		{ assert(0); return 0;}
-	virtual int _collection_rename(const coll_t &c, const coll_t &nc)
-		{ assert(0); return 0;}
-	virtual int _split_collection(coll_t c, uint32_t bits, uint32_t rem, coll_t dest)
-		{ assert(0); return 0;}
-        virtual int _read(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, bufferlist& bl)
-        	{ assert(0); return 0;}
-        virtual int _write(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, const bufferlist& bl, bool replica = false)
-        	{ assert(0); return 0;}
+	virtual int _collection_setattr(coll_t c, const char *name, const void *value, size_t size) { return -1; }
+	virtual int _collection_rmattr(coll_t c, const char *name) { return -1; }
+
+	virtual int _omap_clear(coll_t c, const ghobject_t &o) { return -1; };
+	virtual int _omap_setkeys(coll_t c, const ghobject_t& o, const map<string, bufferlist> &aset) { return -1; }
+	virtual int _omap_rmkeys(coll_t c, const ghobject_t& o, const set<string> &keys) { return -1;}
+	virtual int _omap_rmkeyrange(coll_t c, const ghobject_t& o, const string& first, const string& last) { return -1;}
+	virtual int _omap_setheader(coll_t c, const ghobject_t& o, const bufferlist &bl) { return -1; }
+
+	virtual bool collection_exists(coll_t c) { return false; }
+	virtual bool exists(coll_t c, const ghobject_t& o) { return false; }
+	virtual int _open(coll_t c, const ghobject_t& o) { return -1; }
+	virtual int _touch(coll_t c, const ghobject_t& o) { return -1; }
+	virtual int _zero(coll_t c, const ghobject_t& o, uint64_t off, size_t len) { return -1; }
+	virtual int _truncate(coll_t c, const ghobject_t& o, uint64_t size) { return -1; }
+	virtual int _remove(coll_t c, const ghobject_t &o) { return -1; }
+	virtual int _clone(coll_t c, const ghobject_t& oo, const ghobject_t& no) { return -1; }
+	virtual int _clone_range(coll_t c, const ghobject_t& oo, const ghobject_t& no, 
+		uint64_t srcoff, uint64_t len, uint64_t dstoff) { return -1; }
+
+	virtual int _create_collection(coll_t c) { return -1; }
+	virtual int _destroy_collection(coll_t c) { return -1; }
+	virtual int _collection_add(coll_t dst, coll_t src, const ghobject_t &o) { return -1; }
+	virtual int _collection_move_rename(coll_t oc, const ghobject_t& oo, coll_t nc, const ghobject_t& no) { return -1;}
+	virtual int _collection_rename(const coll_t &c, const coll_t &nc) { return -1;}
+	virtual int _split_collection(coll_t c, uint32_t bits, uint32_t rem, coll_t dest) { return -1; }
+
+        virtual int _read(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, bufferlist& bl) { return -1; }
+        virtual int _write(coll_t c, const ghobject_t& o, uint64_t offset, size_t len, 
+		const bufferlist& bl, bool replica = false) { return -1; }
 } ;
 
 class RWJournal {
@@ -145,6 +136,12 @@ class NVMJournal : public RWJournal {
 
 	header_t header;
 	uint64_t cur_seq;
+	enum {
+	    WRITE_THROUGH_MODE = 1,
+	    WRITE_BACK_MODE,
+	    DEBUG_MODE,
+	    AI_MODE
+	}mode;
 
 	uint64_t write_pos;
 	uint64_t meta_sync_pos;
@@ -153,6 +150,13 @@ class NVMJournal : public RWJournal {
 	uint64_t start_pos;
 	static const uint64_t sync_threshold = 256 << 20; // 256MB
 
+	atomic_t total_wrap;
+	atomic_t total_write;
+	atomic_t total_flush;
+	atomic_t total_evict;
+	atomic_t total_cached;
+	void dump_journal_stat();
+
 	uint64_t max_length;
 
 	string path;
@@ -160,8 +164,11 @@ class NVMJournal : public RWJournal {
 	int fd;
 
 	int _open(bool io_direct = true);
-	int _journal_replay(); // replay
-	bool replay;
+	/* replay journal */
+	bool replay; 
+	bool not_update_meta;
+	void check_replay_point(uint64_t pos);
+	int _journal_replay();
 
 	class ApplyManager {
 	    bool blocked;
@@ -170,7 +177,8 @@ class NVMJournal : public RWJournal {
 	    Cond cond;
 	public:
 	    ApplyManager()
-	    	:open_ops(0), 
+	    	: blocked(false),
+		open_ops(0), 
 	    	lock("NVMJournal::ApplyManager::lock", false, true, false, g_ceph_context)
 	    	{ }
 	    void sync_start();
@@ -206,7 +214,7 @@ class NVMJournal : public RWJournal {
 	Mutex op_throttle_lock;
 	Cond op_throttle_cond;
 	uint64_t op_queue_len;
-	static const uint64_t op_queue_max = 64; 
+	static const uint64_t op_queue_max = 128; 
 	void op_queue_reserve_throttle(ThreadPool::TPHandle *handle);
 	void op_queue_release_throttle();
     public:
@@ -244,7 +252,24 @@ class NVMJournal : public RWJournal {
 
 	void do_aio_write(bufferlist &bl, uint64_t seq);
 
+	/* latency statics */
+	Mutex latency_lock;
+	utime_t journal_aio_latency;
+	utime_t osr_queue_latency;
+	utime_t do_op_latency;
+	int ops;
+	void update_latency(utime_t l1, utime_t l2, utime_t l3) {
+	    Mutex::Locker l(latency_lock);
+	    journal_aio_latency += l1;
+	    osr_queue_latency += l2;
+	    do_op_latency += l3;
+	    ++ops;
+	}
+
 	struct Op {
+	    utime_t journal_latency;
+	    utime_t osr_queue_latency;
+	    utime_t do_op_latency;
 	    uint64_t seq;
 	    uint64_t entry_pos;
 	    uint32_t data_offset;
@@ -335,6 +360,9 @@ class NVMJournal : public RWJournal {
 	    OpSequencer() : Sequencer_impl(),
 		lock("NVMJournal::OpSequencer::lock", false, true, false, g_ceph_context),
 		apply_lock("NVMJournal::OpSequencer::apply_lock", false, true, false, g_ceph_context) {}
+	    ~OpSequencer() {
+		flush();
+	    }
 	    void register_op(uint64_t seq) {
 		Mutex::Locker l(lock);
 		op_q.push_back(seq);
@@ -392,6 +420,7 @@ class NVMJournal : public RWJournal {
 		return false;
 	    }
 
+	  public:
 	    Mutex apply_lock;
 	};
 
@@ -438,23 +467,23 @@ class NVMJournal : public RWJournal {
 	}
 	void _do_op(OpSequencer *posr, ThreadPool::TPHandle *handle);
 
-	bool need_to_update_store(uint64_t pos);
 	void do_op(Op *op, ThreadPool::TPHandle *handle = NULL);
 	void do_transaction(Transaction *t, uint64_t seq, uint64_t entry_pos, uint32_t &off);
 	int _touch(coll_t cid, const ghobject_t &oid);
-	int _write(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len, uint64_t entry_pos, uint32_t boff);
+	int _write(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len, 
+		const bufferlist& bl, uint64_t entry_pos, uint32_t boff);
 	int _zero(coll_t cid, const ghobject_t &oid, uint32_t off, uint32_t len);
-	int _truncate(coll_t cid, const ghobject_t &oid, uint32_t off, bool update_store);
-	int _remove(coll_t cid, const ghobject_t &oid, bool update_store);
-	int _clone(coll_t cid, const ghobject_t &src, const ghobject_t &dst, bool update_store);
+	int _truncate(coll_t cid, const ghobject_t &oid, uint32_t off);
+	int _remove(coll_t cid, const ghobject_t &oid);
+	int _clone(coll_t cid, const ghobject_t &src, const ghobject_t &dst);
 	int _clone_range(coll_t cid, ghobject_t &src, ghobject_t &dst,
-		uint64_t off, uint64_t len, uint64_t dst_off, bool update_store);
-	int _create_collection(coll_t cid, bool update_store);
-	int _destroy_collection(coll_t cid, bool update_store);
-	int _collection_add(coll_t dst, coll_t src, const ghobject_t &oid, bool update_store);
-	int _collection_move_rename(coll_t oldcid, const ghobject_t &oldoid, coll_t newcid, const ghobject_t &newoid, bool update_store);
-	int _collection_rename(coll_t cid, coll_t ncid, bool update_store);
-	int _split_collection(coll_t src, uint32_t bits, uint32_t match, coll_t dst, bool update_store);
+		uint64_t off, uint64_t len, uint64_t dst_off);
+	int _create_collection(coll_t cid);
+	int _destroy_collection(coll_t cid);
+	int _collection_add(coll_t dst, coll_t src, const ghobject_t &oid);
+	int _collection_move_rename(coll_t oldcid, const ghobject_t &oldoid, coll_t newcid, const ghobject_t &newoid);
+	int _collection_rename(coll_t cid, coll_t ncid);
+	int _split_collection(coll_t src, uint32_t bits, uint32_t match, coll_t dst);
 	int do_other_op(int op, Transaction::iterator& p);
 
 	/* memory data structure */
@@ -470,7 +499,8 @@ class NVMJournal : public RWJournal {
 	    } ext;
             enum {ZERO = ~(uint32_t)3, TRUNC};
 	    uint32_t bentry;
-	    uint32_t boff;	
+	    uint32_t boff;
+	    bool dirty;
 	};
 
 	void _flush_bh(ObjectRef obj, BufferHead *pbh);
@@ -520,12 +550,15 @@ class NVMJournal : public RWJournal {
 	    bool done;
 	    deque<BufferHead *> queue;
 	    
-	    EvOp(ObjectRef o, deque<BufferHead *> q)
-		: seq(0), synced(0), obj(0), done(false) { }
+	    EvOp(ObjectRef o, deque<BufferHead *> &q)
+		: seq(0), synced(0), obj(0), done(false) {
+		obj = o;
+		queue.swap(q);
+		}
 	};
 
 	uint64_t ev_seq;
-	map< uint64_t, deque<BufferHead *> > hang_ev;
+	map< uint64_t, deque<BufferHead *> > evict_in_flight;
 	deque<EvOp *> running_ev;
 	deque<EvOp *> ev_queue;
 
@@ -589,8 +622,10 @@ class NVMJournal : public RWJournal {
 	} evictor;
 
 	bool ev_stop;
+	bool force_evict;
 	uint32_t ev_pause;
 	bool ev_paused;
+	void evict_trigger();
 	void stop_evictor();
 	Cond evict_pause_cond;
 	void pause_ev_work();
@@ -599,22 +634,32 @@ class NVMJournal : public RWJournal {
 
 	deque<BufferHead*> reclaim_queue;
 	Mutex reclaim_queue_lock;
-	bool should_relcaim();
+	bool should_reclaim();
 	void do_reclaim();
 
 	struct Object 
 	{
 	    set< pair<coll_t, ghobject_t> > alias;
-	    atomic_t ref;
-	    uint32_t size;
 	    ObjectRef parent;
+	    atomic_t ref;
+	    bool cachable;
+
+	    /* statics */
+	    uint32_t s_write;
+	    uint32_t s_overlap;
+	    uint32_t s_ops;
+
+	    uint32_t size;
 	    map<uint32_t, BufferHead*> data;
 	    RWLock lock;
 	    
-	    Object(coll_t c, ghobject_t o) :
-		ref(0), 
-		size(0),
+	    Object(const coll_t &c, const ghobject_t &o) :
 		parent(NULL),
+		ref(0),
+		cachable(false),
+		s_write(0),
+		s_overlap(0),
+		size(0),
 		lock("NVMJournal::lock") {
 		    alias.insert( make_pair(c, o) );
 	    }
@@ -676,11 +721,15 @@ class NVMJournal : public RWJournal {
 	    obj->lock.put_write();
 	}
 
+	atomic_t merge_ops;
+	atomic_t merge_size;
+	atomic_t merge_and_overlap_ops;
+	atomic_t merge_and_overlap_size;
+	void dump_merge_static();
 	void merge_new_bh(ObjectRef obj, BufferHead *bh);
 	void delete_bh(ObjectRef obj, uint32_t off, uint32_t end, uint32_t bentry);
 
-	void clone(coll_t &ocid, coll_t &ncid, ghobject_t &oid);
-
+	/* Read operation */
 	struct ReadOp 
 	{
 	    coll_t cid;
@@ -688,8 +737,7 @@ class NVMJournal : public RWJournal {
 	    ObjectRef obj;
 	    uint32_t off;
 	    uint32_t length;
-	    bufferlist buf;
-	    // 
+	    bufferlist buf; 
 	    list<ObjectRef> parents;
 
 	    map<uint32_t, uint32_t> hits; // off->len 
