@@ -15,8 +15,10 @@ using std::vector;
 #include "common/errno.h"
 #include "osd/osd_types.h"
 #include "ObjectMap.h"
-
+#include "LevelDBStore.h"
+#include "DBObjectMap.h"
 class ObjectAttrStore {
+    /*memory*/
     struct Object {
 	map<string, bufferptr> xattr;
 	bufferlist omap_header;
@@ -130,8 +132,29 @@ class ObjectAttrStore {
 	    return CollectionRef();
 	return it->second;
     }
+    /*ObjectMap*/
+    LevelDBStore *store;
+    boost::scoped_ptr<ObjectMap> object_map;
+
+    bool using_dbmemory;
 public:
-    ObjectAttrStore(): coll_lock("ObjectAttrStore::coll_lock") { }
+    ObjectAttrStore(bool all_in_memory=false) :
+        coll_lock("ObjectAttrStore::coll_lock"),
+        using_dbmemory(all_in_memory)
+    { }
+    int init(string path, ostream& err) {
+        if (!using_dbmemory) {
+            store = new LevelDBStore(g_ceph_context, path);
+            int ret = store->create_and_open(err);
+            if (ret < 0) {
+                delete store;
+                return ret;
+            }
+            ObjectMap *omap = new DBObjectMap(store);
+            object_map.reset(omap);
+        }
+        return 0;
+    }
 
     int create_collection(const coll_t &c);
     int destroy_collection(const coll_t &c);

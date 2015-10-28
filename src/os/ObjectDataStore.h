@@ -83,17 +83,8 @@ public:
     int collection_getattrs(const coll_t& cid, map<string, bufferptr>& aset);
     bool collection_empty(const coll_t& c);
     int collection_list(const coll_t& cid, vector<ghobject_t>& os);
-/*
-private:
-    // FIXME 
-    int create_current();
-    int list_checkpoints(list<string>& ls);
-    int create_checkpoints(const string& name, uint64_t *id);
-    int sync_checkpoints(uint64_t id);
-    int rollback_to(const string& name);
-    int destroy_checkpoint(const string& name);
-    int syncfs();
-*/
+
+    /*btrfs snapshot interface*/
 public:
     int mkfs();
     int mount();

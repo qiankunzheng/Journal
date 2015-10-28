@@ -364,7 +364,7 @@ int ObjectDataStore::split_collection(const coll_t& cid, uint32_t bits, uint32_t
 /* collection attribute */
 static void get_attrname(const char* name, char* outname, int len)
 {
-    snprintf(outname, len, "ceph.user.%s", name);
+    snprintf(outname, len, "user.ceph.%s", name);
 }
 
 static bool parse_attrname(char **name)
@@ -377,7 +377,7 @@ static bool parse_attrname(char **name)
 }
 
 int ObjectDataStore::collection_setattr(const coll_t& cid, const char* name, const void* value, size_t len)
-{ 
+{
     char path[PATH_MAX];
     get_cdir(cid, path, sizeof(path));
     int fd = ::open(path, O_RDONLY);
@@ -555,54 +555,55 @@ static int _fgetattrs(int fd, map<string,bufferptr>& aset)
     char *names2 = 0;
     char *name = 0;
     if (len == -ERANGE) {
-	len = chain_flistxattr(fd, 0, 0);
-	if (len < 0) {
-	    return len;
-	}
-	names2 = new char[len+1];
-	len = chain_flistxattr(fd, names2, len);
-	if (len < 0) {
-	    return len;
-	}
-	name = names2;
+        len = chain_flistxattr(fd, 0, 0);
+        if (len < 0) {
+            return len;
+        }
+        names2 = new char[len+1];
+        len = chain_flistxattr(fd, names2, len);
+        if (len < 0) {
+            return len;
+        }
+        name = names2;
     } else if (len < 0) {
-	return len;
+        return len;
     } else {
-	name = names1;
+        name = names1;
     }
-    
+
     name[len] = 0;
     char *end = name + len;
     while (name < end) {
-	char *attrname = name;
-	if (parse_attrname(&name)) {
-	    if (*name) {
-		int r = _fgetattr(fd, attrname, aset[name]);
-		if (r < 0)
-		    return r;
-	    }
-	}
-	name += strlen(name) + 1;
+        char *attrname = name;
+        if (parse_attrname(&name)) {
+            if (*name) {
+                int r = _fgetattr(fd, attrname, aset[name]);
+                if (r < 0)
+                    return r;
+            }
+        }
+        name += strlen(name) + 1;
     }
-    
+
     delete[] names2;
     return 0;
 }
 
 int ObjectDataStore::collection_getattr(const coll_t& cid, const char *name, bufferlist& bl)
 {
-        char path[PATH_MAX];
-        get_cdir(cid, path, sizeof(path));
-        int fd = ::open(path, O_RDONLY);
-        if (fd < 0) {
-                return -errno;
-        }
-        bufferptr bp;
-        int r = _fgetattr(fd, name, bp);
-        if (r < 0)
-                return r;
-        bl.push_back(bp);
+    char path[PATH_MAX];
+    get_cdir(cid, path, sizeof(path));
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) 
+        return -errno;
+    bufferptr bp;
+    char attrname[PATH_MAX];
+    get_attrname(name, attrname, sizeof(attrname));
+    int r = _fgetattr(fd, attrname, bp);
+    if (r < 0)
         return r;
+    bl.push_back(bp);
+    return r;
 }
 int ObjectDataStore::collection_getattrs(const coll_t& cid, map<string, bufferptr>& aset)
 {
@@ -634,35 +635,11 @@ int ObjectDataStore::collection_list(const coll_t& cid, vector<ghobject_t>& ls)
     return index->collection_list(&ls);
 }
 
-int ObjectDataStore::mkfs()
-{
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/current", base_path.c_str());
-    int r = ::mkdir(path, 0777);
-    if (r < 0) {
-	r = -errno;
-	if (r != -EEXIST) {
-	    dout(5) << "failed to mkdir(" << path << ")" << dendl;
-	    return r;
-	}
-    }
-    return 0;
-}
-
 int ObjectDataStore::mount()
 {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/current", base_path.c_str());
-    struct stat st;
-    int r = ::stat(path, &st);
-    if (r < 0) {
-	dout(5) << "failed to stat " << path << dendl;
-    }
-    else {
-	wbthrottle.start();
-	mountted = true;
-    }
-    return r;
+    wbthrottle.start();
+    mountted = true;
+    return 0;
 }
 
 void ObjectDataStore::umount() 
@@ -690,5 +667,10 @@ int ObjectDataStore::statfs(struct statfs *st)
 	assert(r != -EIO);
 	return r;
     }
+    return 0;
+}
+
+int ObjectDataStore::mkfs()
+{
     return 0;
 }

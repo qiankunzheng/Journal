@@ -1,12 +1,38 @@
 #include <string>
+#include <sys/ioctl.h>
 #include "include/types.h"
 #include "include/stringify.h"
 #include "common/errno.h"
+#include "include/int_types.h"
+#include "btrfs_ioctl.h"
 #include "NVMStore.h"
 
 #define dout_subsys ceph_subsys_filestore
 #undef dout_prefix
 #define dout_prefix *_dout << __FILE__ << ": " << __func__ << ": " << __LINE__ << ": "
+
+static const int BTRFS_SUPER_MAGIC = 0x9123683E;
+
+int NVMStore::BackStore_Imp::list_checkpoints(deque<uint64_t>& ls)
+{
+    return store->list_checkpoints(ls);
+}
+int NVMStore::BackStore_Imp::create_checkpoint(uint64_t cp, uint64_t *id)
+{
+    return store->create_checkpoint(cp, id);
+}
+int NVMStore::BackStore_Imp::flush_checkpoint(uint64_t id)
+{
+    return store->flush_checkpoint(id);
+}
+int NVMStore::BackStore_Imp::rollback_to(uint64_t cp)
+{
+    return store->rollback_to(cp);
+}
+int NVMStore::BackStore_Imp::delete_checkpoint(uint64_t cp)
+{
+    return store->delete_checkpoint(cp);
+}
 
 int NVMStore::BackStore_Imp::_setattrs(coll_t c, const ghobject_t &oid, map<string, bufferptr> &aset)
 {
@@ -310,25 +336,338 @@ ObjectMap::ObjectMapIterator NVMStore::get_omap_iterator(coll_t cid, const ghobj
     return attr.get_omap_iterator(cid, oid);
 }
 
+int NVMStore::init()
+{
+    int ret = 0;
+    do {
+        if (basefd > 0) {
+            ::close(basefd);
+            basefd = -1;
+        }
+        basefd = ::open(base_path.c_str(), O_RDONLY);
+        if (basefd < 0) {
+            ret = -errno;
+            dout(0) << "open '" << base_path << "' failed with error : " << cpp_strerror(ret) << dendl;
+            break;
+        }
+
+        struct statfs fs;
+        current_path = base_path + "/current";
+        if (currentfd > 0) {
+            ::close(currentfd);
+            currentfd = -1;
+        }
+        currentfd = ::open(current_path.c_str(), O_RDONLY);
+        if (currentfd < 0) {
+            ret = -errno;
+            dout(0) << "open '" << current_path << "' failed with error : " << cpp_strerror(ret) << dendl;
+            break;
+        }
+        ret = ::statfs(current_path.c_str(), &fs);
+        if (ret < 0) {
+            ret = -errno;
+            dout(0) << "cannot statfs " << base_path << dendl;
+            break;
+        }
+        if (fs.f_type != BTRFS_SUPER_MAGIC) {
+            dout(0) << "filesystem should be btrfs" << dendl;
+            ret = -EINVAL;
+        }
+    }while(false);
+
+    if (ret == 0)
+        return ret;
+
+    if (basefd > 0) {
+        close(basefd);
+        basefd = -1;
+    }
+    if (currentfd > 0) {
+        close(currentfd);
+        currentfd = -1;
+    }
+    return ret;
+}
+
+int NVMStore::_mkfs()
+{
+    struct stat st;
+    current_path = base_path + "/current";
+    int ret = ::stat(current_path.c_str(), &st);
+    if (ret == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            dout(0) << "current/ exists but is not directionary" << dendl;
+            return -EINVAL;
+        }
+        struct statfs fs;
+        ret = ::statfs(current_path.c_str(), &fs);
+        if (ret < 0) {
+            ret = -errno;
+            dout(0) << "cannot statfs " << base_path << dendl;
+            return ret;
+        }
+        if (fs.f_type != BTRFS_SUPER_MAGIC) {
+            dout(0) << "filesystem should be btrfs" << dendl;
+            return -EINVAL;
+        }
+        return 0;
+    }
+
+    if (basefd < 0) {
+        basefd = ::open(base_path.c_str(), O_RDONLY);
+        if (basefd < 0) {
+            ret = -errno;
+            dout(0) << "failed to open '" << base_path << "' with error : " << cpp_strerror(ret) << dendl;
+            return ret;
+        }
+    }
+
+    struct btrfs_ioctl_vol_args vol;
+    memset(&vol, 0, sizeof(vol));
+    vol.fd = 0;
+    strcpy(vol.name, "current");
+
+    if (::ioctl(basefd, BTRFS_IOC_SUBVOL_CREATE,(unsigned long int)&vol) < 0) {
+        ret = -errno;
+        dout(0) << "failed to create subvol with error: " << cpp_strerror(ret) << dendl;
+        return ret;
+    }
+
+    if (::chmod(current_path.c_str(), 0755) < 0) {
+        ret = -errno;
+        dout(0) << "failed to chmod " <<  current_path << " with error: " << cpp_strerror(ret) << dendl;
+        return ret;
+    }
+    return 0;
+}
+
+int NVMStore::list_checkpoints(deque<uint64_t>& cps)
+{
+    int ret = 0;
+    DIR *dir = ::opendir(base_path.c_str());
+    if (!dir) {
+        ret = -errno;
+        dout(0) << "opendir " << base_path << " failed with error: " << cpp_strerror(ret) << dendl;
+        return ret;
+    }
+    list<uint64_t> snapshots;
+    char path[PATH_MAX];
+    char buf[offsetof(struct dirent, d_name) + PATH_MAX + 1];
+    struct dirent *ent;
+    while (::readdir_r(dir, (struct dirent*)&buf, &ent) == 0) {
+        if (!ent)
+            break;
+        snprintf(path, sizeof(path), "%s/%s", base_path.c_str(), ent->d_name);
+        struct stat st;
+        ret = ::stat(path, &st);
+        if (ret < 0) {
+            int err = -errno;
+            dout(0) << "stat " << path << " failed with error : " << cpp_strerror(err) << dendl;
+            break;
+        }
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        struct statfs fs;
+        ret = ::statfs(path, &fs);
+        if (ret < 0) {
+            int err = -errno;
+            dout(0) << "statfs " << path << " failed with error : " << cpp_strerror(err) << dendl;
+            break;
+        }
+        if (fs.f_type == BTRFS_SUPER_MAGIC) {
+            stringstream ss;
+            ss << ent->d_name;
+            uint64_t seq = 0;
+            ss >> seq;
+            if (seq > 0)
+                snapshots.push_back(seq);
+        }
+    }
+    ::closedir(dir);
+    snapshots.sort();
+    for (list<uint64_t>::iterator it=snapshots.begin();
+            it != snapshots.end();
+            ++ it) {
+        cps.push_back(*it);
+    }
+    return 0;
+}
+int NVMStore::create_checkpoint(uint64_t cp, uint64_t* transid)
+{
+    dout(5) << "create checkpoint:" << cp << dendl;
+    struct btrfs_ioctl_vol_args_v2 vol;
+    stringstream ss;
+    ss << cp;
+    string volname;
+    ss >> volname;
+
+    memset(&vol, 0, sizeof(vol));
+    vol.fd = currentfd;
+    vol.flags = BTRFS_SUBVOL_CREATE_ASYNC;
+    strncpy(vol.name, volname.c_str(), sizeof(vol.name));
+    int ret = ::ioctl(basefd, BTRFS_IOC_SNAP_CREATE_V2, &vol);
+    if (ret < 0) {
+        ret = -errno;
+        dout(0) << "async snap create '" << volname << "' failed with error : " << cpp_strerror(ret) 
+            << ", basefd = " << basefd
+            << ", currentfd = " << currentfd << dendl;
+        return ret;
+    }
+    *transid = vol.transid;
+    return 0;
+}
+int NVMStore::flush_checkpoint(uint64_t transid)
+{
+    dout(5) << "waiting for completion of checkpoint, tranid =  " << transid << dendl;
+    int ret = ::ioctl(basefd, BTRFS_IOC_WAIT_SYNC, &transid);
+    if (ret < 0) {
+        ret = -errno;
+        dout(0) << "ioctl BTRFS_IOC_WAIT_SYNC failed with error : " << cpp_strerror(ret) << dendl;
+        return ret;
+    }
+    dout(5) << "checkpoint success, transid = " << transid << dendl;
+    return 0;
+}
+int NVMStore::rollback_to(uint64_t cp)
+{
+    dout(5) << " rollback to checkpoint '" << cp << "'" << dendl;
+    if (currentfd > 0) {
+        ::close(currentfd);
+        currentfd = -1;
+    }
+    int ret = delete_subvolume("current"); 
+    if (ret && errno!=ENOENT) {
+        dout(0) << "failed to remove current subvol with error: " << cpp_strerror(ret) << dendl;
+        stringstream ss;
+        string name;
+        ss << base_path << "/" << "current.old." << rand();
+        ss >> name;
+        ::rename(current_path.c_str(), name.c_str());
+    }
+
+    btrfs_ioctl_vol_args vol;
+    memset(&vol, 0, sizeof(vol));
+    string volpath;
+    {
+        stringstream ss;
+        ss << base_path << "/" << cp;
+        ss >> volpath;
+    }
+    vol.fd = ::open(volpath.c_str(), O_RDONLY);
+    if (vol.fd < 0) {
+        ret = -errno;
+        dout(0) << "failed to open '" << volpath << "' with error : " << cpp_strerror(ret) << dendl;
+        return ret;
+    }
+    strcpy(vol.name, "current");
+
+    ret = ::ioctl(basefd, BTRFS_IOC_SNAP_CREATE, &vol);
+    if (ret < 0) {
+        ret = -errno;
+        dout(0) << "BTRFS_IOC_SNAP_CREATE failed with error : " << cpp_strerror(ret) << dendl;
+    }
+    close(vol.fd);
+   
+    currentfd = ::open(current_path.c_str(), O_RDONLY);
+    if (currentfd < 0) {
+        ret = -errno;
+        dout(0) << "failed to open '" << current_path << "' with error: " << cpp_strerror(ret) << dendl;
+    }
+
+    dout(5) << "rollback success!" << dendl;
+    return ret;
+}
+
+int NVMStore::delete_checkpoint(uint64_t cp)
+{
+    string volname;
+    {
+        stringstream ss;
+        ss << cp;
+        ss >> volname;
+    }
+    return delete_subvolume(volname);
+}
+
+int NVMStore::delete_subvolume(string volname)
+{
+    dout(1) << "delete subvolume '" << volname << "'" << dendl;
+    btrfs_ioctl_vol_args vol;
+    memset(&vol, 0, sizeof(vol));
+    vol.fd = 0;
+    strncpy(vol.name, volname.c_str(), sizeof(vol.name));
+
+    int ret = ::ioctl(basefd, BTRFS_IOC_SNAP_DESTROY, &vol);
+    if (ret) {
+        ret = -errno;
+        dout(0) << "ioctl SNAP_DESTROY failed with error : " << cpp_strerror(ret) << dendl;
+        return ret;
+    }
+    return 0;
+}
+
 int NVMStore::mount()
 {
-    finisher.start();
-    int r = data.mount();
-    if (r < 0) {
-	data.umount();
-	return r;
+    if (0) {
+        /*just debug*/
+        stringstream ss;
+        ceph::BackTrace bt(1);
+        bt.print(ss);
+        dout(0) << ss.str() << dendl;
     }
-    r = Journal->create();
-    if (r < 0)
-	data.umount();
-    return r;
+    int ret = 0;
+    do {
+        if (really_mountted)
+            break;
+        finisher.start();
+        ret = init();
+        if (ret < 0)
+            break;
+
+        deque<uint64_t> checkpoints;
+        int ret = list_checkpoints(checkpoints);
+        if (ret < 0)
+            break;
+        if (!checkpoints.empty()) {
+            rollback_to(checkpoints.back());
+        }
+        else {
+            /*clear current*/
+        }
+
+        ret = data.mount();
+        if (ret < 0)
+            break;
+
+        stringstream ss;
+        ret = attr.init(current_path+"/omap", ss);
+        if (ret < 0) {
+            dout(0) << "failed to initialize omap with error :" << ss.str() << dendl;
+            break;
+        }
+
+        ret = Journal->replay_journal();
+        if (ret < 0)
+            break;
+        ret = Journal->create();
+        if (ret < 0)
+            break;
+        really_mountted = true;
+    }while(false);
+
+    if (ret < 0) {
+        data.umount();
+        finisher.stop();
+        close(basefd);
+        close(currentfd);
+        basefd = -1;
+        currentfd = -1;
+    }
+    return ret;
 }
 
 int NVMStore::umount()
 {
-    Journal->stop();
-    data.umount();
-    finisher.stop();
     return 0;
 }
 
@@ -348,12 +687,23 @@ int NVMStore::mkfs()
     else
 	dout(1) << "had fsid" << fsid << dendl;
 
+    r = _mkfs();
+    if (r < 0)
+        return r;
+    
+    stringstream ss;
+    r = attr.init(current_path + "/omap", ss);
+    if (r < 0) {
+        dout(0) << ss.str() << dendl;
+        return r;
+    }
+
     r = Journal->mkjournal();
     if (r < 0) {
 	dout(0) << "failed to mkjournal" << dendl;
 	return r;
     }
-    return data.mkfs();
+    return r;
 }
 
 int NVMStore::mkjournal()
