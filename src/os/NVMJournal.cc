@@ -176,12 +176,15 @@ int NVMJournal::_journal_replay()
                     {
                         Mutex::Locker l(lock);
                         if (queue->empty()) {
+                            if (stop)
+                                return NULL;
                             cond2.Signal();
                             cond.Wait(lock);
                             continue;
                         }
                         op = queue->front();
                         queue->pop_front();
+                        cond.Signal();
                     }
                     Journal->do_op(op);
                     delete op;
@@ -190,17 +193,21 @@ int NVMJournal::_journal_replay()
             }
             void queue_op(Op *op) {
                 Mutex::Locker l(lock);
+                while (queue->size() > 20)
+                    cond.Wait(lock);
                 queue->push_back(op);
                 cond.Signal();
             }
             void stop_and_wait() {
                 while(true) {
                     Mutex::Locker l(lock);
-                    if (queue->empty())
+                    if (queue->empty()) {
+                        stop = true;
+                        cond.Signal();
                         break;
+                    }
                     cond2.Wait(lock);
                 }
-                stop = true;
             }
         private:
             NVMJournal *Journal;
