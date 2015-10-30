@@ -186,8 +186,35 @@ int ObjectAttrStore::setattrs(const coll_t &c, const ghobject_t &oid,const map<s
                 ++it) {
             omap_set[it->first].push_back(it->second);
         }
-        if (!omap_set.empty())
-            return object_map->set_xattrs(oid, omap_set, NULL);
+        if (!omap_set.empty()) {
+            int ret = 0, pass_test = 0;
+            do {
+                ret = object_map->set_xattrs(oid, omap_set, NULL);
+                if (ret < 0)
+                    break;
+                if (0) {
+                    /*just for debug*/
+                    set<string> xattrs;
+                    stringstream ss;
+                    ret = object_map->get_all_xattrs(oid, &xattrs);
+                    for (map<string, bufferptr>::const_iterator it = aset.begin();
+                            it != aset.end();
+                            ++ it) {
+                        if (xattrs.find(it->first) == xattrs.end()) {
+                            pass_test = -1;
+                            break;
+                        }
+                        ss << it->first << " ";
+                    }
+                    dout(5) << "success set xattrs: " << ss.str() << dendl;
+                }
+            } while(false);
+            if (pass_test < 0)
+                dout(5) << "failed to pass debug test with oid = '" << oid << "'" << dendl;
+            if (ret < 0)
+                dout(5) << "failed to set xattrs with oid = '" << oid << "'" << dendl;
+            return ret;
+        }
     }
     return 0;
 }
@@ -247,6 +274,7 @@ int ObjectAttrStore::rmattrs(const coll_t &c, const ghobject_t &oid)
 
 int ObjectAttrStore::getattr(const coll_t &c, const ghobject_t &oid, const char *name, bufferptr &value)
 {
+    dout(5) << "oid = '" << oid << "', name = '" << name << "'" << dendl;
     if (using_dbmemory) {
         CollectionRef coll = get_collection(c);
         if (!coll)
@@ -287,22 +315,21 @@ int ObjectAttrStore::getattrs(const coll_t &c, const ghobject_t &oid, map<string
     else {
         set<string> omap_to_get;
         int ret = object_map->get_all_xattrs(oid, &omap_to_get);
-        if (ret<0 && ret!=-ENOENT) {
-            dout(1) << "failed to list xattrs of '" << oid << "'" << dendl;
+        if (ret<0 && ret!=-ENOENT)
             return ret;
-        }
         if (!omap_to_get.empty()) {
             map<string, bufferlist> omap_got;
             ret = object_map->get_xattrs(oid, omap_to_get, &omap_got);
-            if (ret<0 && ret!=-ENOENT) {
-                dout(1) << "failed to get xattrs of '" << oid << "'" << dendl;
+            if (ret<0 && ret!=-ENOENT)
                 return ret;
-            }
             for (map<string, bufferlist>::iterator it = omap_got.begin();
                     it != omap_got.end();
                     ++it) {
                 aset.insert(make_pair(it->first, bufferptr(it->second.c_str(), it->second.length())));
             }
+        }
+        else {
+            dout(1) << "no attributes with oid = '" << oid << "'" << dendl;
         }
     }
     return 0;

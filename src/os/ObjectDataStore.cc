@@ -120,6 +120,13 @@ int ObjectDataStore::lfn_open(const coll_t& cid, const ghobject_t& oid, bool cre
 	    VOID_TEMP_FAILURE_RETRY(::close(fd));
 	    return r;
 	}
+        bufferlist bl;
+        oid.encode(bl);
+        r = chain_setxattr(path->path(), "user.ceph.obj", bl.c_str(), bl.length());
+        if (r < 0) {
+	    VOID_TEMP_FAILURE_RETRY(::close(fd));
+            return r;
+        }
     }
 
     *outfd = fdcache.add(oid, fd, NULL);
@@ -137,71 +144,74 @@ int ObjectDataStore::lfn_link(const coll_t& c, const coll_t& nc, const ghobject_
     bool same = false;
     int r, exist;
     if (c == nc) {
-	r = get_index(nc, &new_index);
-	if (r < 0)
-	    return r;
-	old_index = new_index;
-	same = true;
+        r = get_index(nc, &new_index);
+        if (r < 0)
+            return r;
+        old_index = new_index;
+        same = true;
     }
     else {
-	r = get_index(c, &old_index);
-	if (r < 0)
-	    return r;
-	r = get_index(nc, &new_index);
-	if (r < 0)
-	    return r;
+        r = get_index(c, &old_index);
+        if (r < 0)
+            return r;
+        r = get_index(nc, &new_index);
+        if (r < 0)
+            return r;
     }
 
     if (same) {
-	RWLock::WLocker l(old_index->access_lock);
-	r = old_index->lookup(o, &old_path, &exist);
-	if (r < 0) {
-	    assert(r != -EIO);
-	    return r;
-	}
-	if (!exist)
-	    return -ENOENT;
-	r = old_index->lookup(no, &new_path, &exist);
-	if (r < 0) {
-	    assert(r != -EIO);
-	    return r;
-	}
-	if (exist)
-	    return -EEXIST;
-	r = ::link(old_path->path(), new_path->path());
-	if (r < 0)
-	    return r;
-	r = old_index->created(no, new_path->path());
-	if (r < 0)
-	    return r;
+        RWLock::WLocker l(old_index->access_lock);
+        r = old_index->lookup(o, &old_path, &exist);
+        if (r < 0) {
+            assert(r != -EIO);
+            return r;
+        }
+        if (!exist)
+            return -ENOENT;
+        r = old_index->lookup(no, &new_path, &exist);
+        if (r < 0) {
+            assert(r != -EIO);
+            return r;
+        }
+        if (exist)
+            return -EEXIST;
+        r = ::link(old_path->path(), new_path->path());
+        if (r < 0)
+            return r;
+        r = old_index->created(no, new_path->path());
+        if (r < 0)
+            return r;
     }
     else {
-	RWLock::RLocker l1(old_index->access_lock);
-	r = old_index->lookup(o, &old_path, &exist);
-	if (r < 0) {
-	    assert(r != -EIO);
-	    return r;
-	}
-	if (!exist)
-	    return -ENOENT;
-	
-	RWLock::WLocker l2(new_index->access_lock);
-	r = new_index->lookup(no, &new_path, &exist);
-	if (r < 0) {
-	    assert(r != -EIO);
-	    return r;
-	}
-	if (exist) 
-	    return -EEXIST;
+        RWLock::RLocker l1(old_index->access_lock);
+        r = old_index->lookup(o, &old_path, &exist);
+        if (r < 0) {
+            assert(r != -EIO);
+            return r;
+        }
+        if (!exist)
+            return -ENOENT;
 
-	r = ::link(old_path->path(), new_path->path());
-	if (r < 0)
-	    return r;
-	r = new_index->created(no, new_path->path());
-	if (r < 0)
-	    return r;
+        RWLock::WLocker l2(new_index->access_lock);
+        r = new_index->lookup(no, &new_path, &exist);
+        if (r < 0) {
+            assert(r != -EIO);
+            return r;
+        }
+        if (exist) 
+            return -EEXIST;
+
+        r = ::link(old_path->path(), new_path->path());
+        if (r < 0)
+            return r;
+        r = new_index->created(no, new_path->path());
+        if (r < 0)
+            return r;
     }
-    return 0;
+    bufferlist bl;
+    no.encode(bl);
+    r = chain_setxattr(new_path->path(), "user.ceph.obj", bl.c_str(), bl.length());
+    return r;
 }
 
 int ObjectDataStore::lfn_unlink(const coll_t& cid, const ghobject_t& oid)
@@ -632,7 +642,28 @@ int ObjectDataStore::collection_list(const coll_t& cid, vector<ghobject_t>& ls)
     if (r < 0)
 	return r;
     RWLock::RLocker l(index->access_lock);
-    return index->collection_list(&ls);
+    r = index->collection_list(&ls);
+    if (r < 0)
+        return r;
+    for (vector<ghobject_t>::iterator it = ls.begin();
+            it != ls.end();
+            ++ it) {
+        IndexedPath path;
+        r = lfn_find(*it, index, &path);
+        if (r < 0)
+            return r;
+        bufferptr bp(PATH_MAX);
+        r = chain_getxattr(path->path(), "user.ceph.obj", bp.c_str(), bp.length());
+        if (r < 0) {
+            dout(5) << "oid = '" << *it << "', path = " << path->path() << ": no user.ceph.obj attribute" << dendl;
+            continue;
+        }
+        bufferlist bl;
+        bl.push_back(bp);
+        bufferlist::iterator p = bl.begin();
+        it->decode(p);
+    }
+    return 0;
 }
 
 int ObjectDataStore::mount()

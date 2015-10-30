@@ -83,8 +83,6 @@ public:
     int collection_getattrs(const coll_t& cid, map<string, bufferptr>& aset);
     bool collection_empty(const coll_t& c);
     int collection_list(const coll_t& cid, vector<ghobject_t>& os);
-
-    /*btrfs snapshot interface*/
 public:
     int mkfs();
     int mount();

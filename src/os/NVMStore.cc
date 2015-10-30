@@ -204,7 +204,14 @@ bool NVMStore::exists(coll_t cid, const ghobject_t &oid)
 
 int NVMStore::stat(coll_t cid, const ghobject_t &oid, struct stat *st, bool allow_eio)
 {
-    return data.stat(cid, oid, st);
+    int ret = data.stat(cid, oid, st);
+    if (ret < 0)
+        return ret;
+    /*FIXME*/
+    uint64_t size = Journal->get_object_size(cid, oid);
+    if (size)
+        st->st_size = size;
+    return ret;
 }
 
 int NVMStore::read(coll_t cid, const ghobject_t &oid, uint64_t offset, size_t len, bufferlist &bl, bool allow_eio)
@@ -649,7 +656,7 @@ int NVMStore::mount()
         ret = Journal->replay_journal();
         if (ret < 0)
             break;
-        ret = Journal->create();
+        ret = Journal->start();
         if (ret < 0)
             break;
         really_mountted = true;

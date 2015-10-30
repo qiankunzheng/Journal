@@ -3,7 +3,7 @@
 
 #include "common/Finisher.h"
 #include "ObjectStore.h"
-#include "NVMJournal.h"
+#include "RWJournal.h"
 #include "ObjectDataStore.h"
 #include "ObjectAttrStore.h"
 
@@ -68,7 +68,7 @@ class NVMStore: public ObjectStore {
     ObjectAttrStore attr;
 
     BackStore_Imp bs;
-    NVMJournal *Journal;
+    RWJournal *Journal;
 
     bool really_mountted;
     int init();
@@ -89,7 +89,7 @@ public:
         bs(this),
         really_mountted(false)
     {
-        Journal = new NVMJournal(jpath, path, &bs, &finisher);
+        Journal = RWJournal::create(jpath, path, &bs, &finisher);
     }
     virtual ~NVMStore()
     {

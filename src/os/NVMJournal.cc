@@ -159,19 +159,74 @@ int NVMJournal::_journal_replay()
     int ret = 0;
     uint64_t seq, pos;
     seq = 0;
-    pos = data_sync_pos; 
+    pos = data_sync_pos;
+
+    deque<Op*> op_queue;
+    class JournalReplayer: public Thread {
+        public:
+            JournalReplayer(NVMJournal *j, deque<Op*> *q): 
+                Journal(j), queue(q), stop(false),
+                lock("NVMJournal::JournalReplayer::Lock", false, true, false, g_ceph_context)
+            { }
+            void *entry()
+            {
+                while (!stop)
+                {
+                    Op *op = NULL;
+                    {
+                        Mutex::Locker l(lock);
+                        if (queue->empty()) {
+                            cond2.Signal();
+                            cond.Wait(lock);
+                            continue;
+                        }
+                        op = queue->front();
+                        queue->pop_front();
+                    }
+                    Journal->do_op(op);
+                    delete op;
+                }
+                return NULL;
+            }
+            void queue_op(Op *op) {
+                Mutex::Locker l(lock);
+                queue->push_back(op);
+                cond.Signal();
+            }
+            void stop_and_wait() {
+                while(true) {
+                    Mutex::Locker l(lock);
+                    if (queue->empty())
+                        break;
+                    cond2.Wait(lock);
+                }
+                stop = true;
+            }
+        private:
+            NVMJournal *Journal;
+            deque<Op*> *queue;
+            bool stop;
+            Mutex lock;
+            Cond cond, cond2;
+    };
+
+    JournalReplayer Replayer(this, &op_queue);
+    Replayer.create();
 
     while (!ret) {
         Op *op = new Op();
         check_replay_point(pos);
         ret = read_entry(pos, seq, op);
         if (ret == 0  && pos != 0) {
-            do_op(op);
+            Replayer.queue_op(op);
             cur_seq = seq;
             write_pos = pos;
         }
-        delete op;
     }
+    Replayer.stop_and_wait();
+    Replayer.join();
+
+    meta_sync_pos = write_pos;
     replay = false;
     not_update_meta = false;
     return 0;
@@ -244,7 +299,7 @@ int NVMJournal::replay_journal()
     return ret;
 }
 
-int NVMJournal::create()
+int NVMJournal::start()
 {
     if (_open(true) < 0)
         return -1; 
@@ -2405,6 +2460,20 @@ int NVMJournal::read_object(coll_t cid, const ghobject_t &oid, uint64_t off, siz
     return r;
 }
 
+uint64_t NVMJournal::get_object_size(coll_t cid, const ghobject_t &oid)
+{
+   uint64_t size = 0;
+   ObjectRef obj = get_object(cid, oid);
+   if (!obj)
+       return size;
+   {
+       RWLock::RLocker lock(obj->lock);
+       size = obj->size;
+   }
+   put_object(obj);
+   return size;
+
+}
 /* backgroud evict thread */
 void NVMJournal::evict_entry()
 {
@@ -2413,7 +2482,8 @@ void NVMJournal::evict_entry()
     utime_t interval;
     int max_evict_in_flight = 10;
     interval.set_from_double(1.0);
-
+    
+    assert(replay == false);
     utime_t dump_interval;
     dump_interval.set_from_double(20.0);
     utime_t latest = ceph_clock_now(g_ceph_context);
